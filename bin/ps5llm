@@ -1,0 +1,1566 @@
+#!/bin/sh
+# ps5llm - PS5 LLM Administration CLI
+# Usage: ps5llm <command>
+#
+# NOTE: `set -eu` WITHOUT pipefail on purpose - /bin/sh on the appliance is
+# busybox ash, which has no pipefail option (the script would die on load).
+# All pipelines below are written to be correct with plain `set -eu`
+# (failing greps are masked by tail/head/cut or guarded with || ).
+set -eu
+
+# sbin dirs are NOT on sshd's default non-interactive PATH (iw, udhcpc,
+# wpa_supplicant live there) - normalize first so SSH one-liners work exactly
+# like console/terminal sessions.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
+CONFIG_DIR="/etc/llama"
+CONFIG_FILE="$CONFIG_DIR/llama.conf"
+MODELS_CONF="$CONFIG_DIR/models.conf"
+DEFAULT_CTX=8192
+MODELS_DIR="/models"
+LLAMA_BIN="/opt/llama.cpp/llama-server"
+
+# GPU workaround shared with the working Ubuntu setup (BC250/Oberon docs).
+export RADV_DEBUG=nohiz
+export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json
+
+# Helper: check if llama.cpp is running
+llama_running() {
+    pidof "$(basename "$LLAMA_BIN")" >/dev/null 2>&1
+}
+
+# Helper: check if SSH (OpenSSH) is running
+ssh_running() {
+    pidof sshd >/dev/null 2>&1
+}
+
+# Helper: check GPU render node (llama.cpp Vulkan needs this; a 27B model
+# cannot run on CPU, so we fail loudly instead of silently falling back)
+gpu_ready() {
+    [ -e /dev/dri/renderD128 ]
+}
+
+# Helper: list wireless interfaces whatever they're named. USB adapters come
+# up as wlan*, the onboard NXP/moal driver uses sta_name=mlan -> mlan*,
+# systemd-style names look like wlp*. Prefers `iw dev`, falls back to sysfs
+# name globs. One name per line, deduplicated, may be empty.
+wifi_ifaces() {
+    {
+        if command -v iw >/dev/null 2>&1; then
+            iw dev 2>/dev/null | awk '$1=="Interface"{print $2}'
+        fi
+        ls /sys/class/net/ 2>/dev/null | grep -E '^(wlan|mlan|wlp)' || true
+    } | grep -v '^$' | sort -u
+}
+
+# Helper: get current model path
+get_current_model() {
+    if [ -f "$CONFIG_FILE" ]; then
+        grep '^MODEL=' "$CONFIG_FILE" 2>/dev/null | cut -d= -f2
+    fi
+}
+
+# Helper: get llama.cpp config values
+get_config() {
+    local key="$1"
+    if [ -f "$CONFIG_FILE" ]; then
+        grep "^${key}=" "$CONFIG_FILE" 2>/dev/null | cut -d= -f2-
+    fi
+}
+
+# Helper: set config value (portable: no sed -i, fixed-string match, so
+# model paths with dots/spaces/ampersands can never corrupt the file)
+set_config() {
+    local key="$1" value="$2"
+    mkdir -p "$CONFIG_DIR"
+    touch "$CONFIG_FILE"
+    # grep -v exits 1 when every line is filtered out - that is fine here.
+    grep -v "^${key}=" "$CONFIG_FILE" > "$CONFIG_FILE.tmp" || true
+    mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+    echo "${key}=${value}" >> "$CONFIG_FILE"
+}
+
+# Helper: per-model context size (each model remembers its own window).
+# Stored in $MODELS_CONF as "<path>|<ctx>" lines.
+# Fixed ladder (PS5LM Plus style): only these values are accepted on write.
+# The app's planner treats context as a fixed list instead of a free number;
+# the app stops at 131072, this extends the same ladder to 1048576. All
+# values are multiples of 256 (llama's --ctx-size granularity), so the
+# effective n_ctx equals the chosen value exactly. Existing non-ladder
+# values (e.g. a model's factory window) stay readable and loadable.
+CTX_LADDER="4096 8192 16384 32768 65536 131072 262144 524288 1048576"
+model_ctx_get() {
+    local c=""
+    if [ -f "$MODELS_CONF" ]; then
+        c=$(grep -F "$1|" "$MODELS_CONF" 2>/dev/null | cut -d'|' -f2 | tail -1)
+    fi
+    [ -n "$c" ] && echo "$c" || echo "$DEFAULT_CTX"
+}
+
+model_ctx_set() {
+    local path="$1" ctx="$2"
+    case "$ctx" in ''|*[!0-9]*) echo "Not a number: $ctx" >&2; return 1;; esac
+    case " $CTX_LADDER " in
+        *" $ctx "*) ;;
+        *) echo "Not an allowed context window: $ctx" >&2
+           echo "Allowed (fixed ladder, 4k-1M): $CTX_LADDER" >&2; return 1;;
+    esac
+    mkdir -p "$CONFIG_DIR"
+    touch "$MODELS_CONF"
+    # Portable fixed-string replace (no sed -i): filter out the old entry,
+    # then append. grep -v exit 1 (all lines filtered) is fine.
+    grep -vF "$path|" "$MODELS_CONF" > "$MODELS_CONF.tmp" || true
+    mv "$MODELS_CONF.tmp" "$MODELS_CONF"
+    echo "$path|$ctx" >> "$MODELS_CONF"
+}
+
+
+# ---------- per-model sampling parameters ----------
+# TEMP / TOP_K / TOP_P / MIN_P / REPEAT_PENALTY / PRESENCE_PENALTY.
+# Stored in $SAMPLING_CONF as
+#   "<absolute .gguf path>|<temp>|<top_k>|<top_p>|<min_p>|<repeat>|<presence>"
+# A model with no row uses model_sampling_defaults(), the same recommendations
+# PS5LM Plus applies in its preset table (penalties use llama.cpp defaults).
+# Values are written to llama.conf and read by the llama-server init script.
+SAMPLING_CONF="$CONFIG_DIR/sampling.conf"
+
+# model_sampling_defaults <path> -> "temp|top_k|top_p|min_p|repeat|presence"
+model_sampling_defaults() {
+    local n
+    n=$(basename "${1:-}" 2>/dev/null | tr 'A-Z' 'a-z')
+    case "$n" in
+        # Bonsai is Qwen 3.8 in ternary weights: its own card wins.
+        *bonsai*)                 echo "1.0|20|0.95|0.05|1.0|0.0" ;;
+        *qwen3.8*|*qwen-3.8*)     echo "0.6|20|0.95|0.0|1.0|0.0" ;;
+        *qwen3.6*|*qwen-3.6*)     echo "0.6|20|0.95|0.0|1.0|0.0" ;;
+        *qwen3.5*|*qwen-3.5*)     echo "0.6|20|0.95|0.0|1.0|0.0" ;;
+        *ornith*)                 echo "0.6|20|0.95|0.0|1.0|0.0" ;;
+        *gemma*)                  echo "1.0|64|0.95|0.0|1.0|0.0" ;;
+        *gpt-oss*|*gpt_oss*)      echo "1.0|20|1.0|0.0|1.0|0.0" ;;
+        *granite*)                echo "0.0|20|0.95|0.0|1.0|0.0" ;;
+        *nemotron*)               echo "0.6|20|0.95|0.0|1.0|0.0" ;;
+        *mistral*)                echo "0.15|20|0.95|0.0|1.0|0.0" ;;
+        *llama*)                  echo "0.6|20|0.9|0.0|1.0|0.0" ;;
+        *qwen3*|*swift*)          echo "0.6|20|0.95|0.0|1.0|0.0" ;;
+        *)                        echo "0.6|20|0.95|0.0|1.0|0.0" ;;
+    esac
+}
+
+# model_sampling_get <path> -> "temp|top_k|top_p|min_p|repeat|presence"
+model_sampling_get() {
+    local line="" path="$1" vals temp top_k top_p min_p repeat presence
+    if [ -f "$SAMPLING_CONF" ]; then
+        line=$(grep -F "$path|" "$SAMPLING_CONF" 2>/dev/null | tail -1 || true)
+    fi
+    if [ -n "$line" ]; then
+        vals=$(echo "$line" | cut -d'|' -f2-)
+        temp=$(echo "$vals" | cut -d'|' -f1)
+        top_k=$(echo "$vals" | cut -d'|' -f2)
+        top_p=$(echo "$vals" | cut -d'|' -f3)
+        min_p=$(echo "$vals" | cut -d'|' -f4)
+        repeat=$(echo "$vals" | cut -d'|' -f5)
+        presence=$(echo "$vals" | cut -d'|' -f6)
+        # Rows written by the 4-parameter version: keep them, add defaults.
+        [ -n "$repeat" ] || repeat=1.0
+        [ -n "$presence" ] || presence=0.0
+        echo "$temp|$top_k|$top_p|$min_p|$repeat|$presence"
+    else
+        model_sampling_defaults "$path"
+    fi
+}
+
+# model_sampling_has_override <path> -> 0 if a saved row exists
+model_sampling_has_override() {
+    [ -f "$SAMPLING_CONF" ] || return 1
+    grep -qF "$1|" "$SAMPLING_CONF" 2>/dev/null
+}
+
+# model_sampling_set <path> <temp> <top_k> <top_p> <min_p> <repeat> <presence>
+model_sampling_set() {
+    local path="$1" temp="$2" top_k="$3" top_p="$4" min_p="$5" repeat="$6" presence="$7"
+    mkdir -p "$CONFIG_DIR"
+    touch "$SAMPLING_CONF"
+    grep -vF "$path|" "$SAMPLING_CONF" > "$SAMPLING_CONF.tmp" || true
+    mv "$SAMPLING_CONF.tmp" "$SAMPLING_CONF"
+    echo "$path|$temp|$top_k|$top_p|$min_p|$repeat|$presence" >> "$SAMPLING_CONF"
+}
+
+# model_sampling_reset <path> -> drop the saved row (back to preset defaults)
+model_sampling_reset() {
+    [ -f "$SAMPLING_CONF" ] || return 0
+    grep -vF "$1|" "$SAMPLING_CONF" > "$SAMPLING_CONF.tmp" || true
+    mv "$SAMPLING_CONF.tmp" "$SAMPLING_CONF"
+}
+
+# apply_model_sampling <path> -> write this model's values into llama.conf
+apply_model_sampling() {
+    local path="${1:-$(get_current_model)}" vals
+    [ -n "$path" ] || return 1
+    vals=$(model_sampling_get "$path")
+    set_config TEMP             "$(echo "$vals" | cut -d'|' -f1)"
+    set_config TOP_K            "$(echo "$vals" | cut -d'|' -f2)"
+    set_config TOP_P            "$(echo "$vals" | cut -d'|' -f3)"
+    set_config MIN_P            "$(echo "$vals" | cut -d'|' -f4)"
+    set_config REPEAT_PENALTY   "$(echo "$vals" | cut -d'|' -f5)"
+    set_config PRESENCE_PENALTY "$(echo "$vals" | cut -d'|' -f6)"
+}
+
+# validate_sampling_value <kind> <value>
+validate_float() {
+    echo "$1" | grep -Eq '^-?[0-9]+([.][0-9]+)?$'
+}
+
+validate_sampling_value() {
+    local kind="$1" value="$2" lo hi
+    case "$kind" in
+        TOP_K)
+            case "$value" in ''|*[!0-9]*) echo "TOP_K must be an integer (got: '$value')" >&2; return 1;; esac
+            [ "$value" -ge 1 ] && [ "$value" -le 100 ] || { echo "TOP_K must be 1-100 (got: $value)" >&2; return 1; }
+            return 0 ;;
+        TEMP)             lo=0.0; hi=2.0 ;;
+        TOP_P|MIN_P)      lo=0.0; hi=1.0 ;;
+        REPEAT_PENALTY)   lo=0.0; hi=4.0 ;;
+        PRESENCE_PENALTY) lo=-2.0; hi=2.0 ;;
+        *) echo "Unknown sampling parameter: $kind" >&2; return 1 ;;
+    esac
+    validate_float "$value" || { echo "$kind must be a number (got: '$value')" >&2; return 1; }
+    awk -v v="$value" -v lo="$lo" -v hi="$hi" 'BEGIN{exit !(v >= lo && v <= hi)}' || {
+        echo "$kind must be between $lo and $hi (got: $value)" >&2; return 1; }
+    return 0
+}
+
+# Command: sampling [status|temp|top_k|top_p|min_p|repeat_penalty|presence_penalty] ...
+cmd_sampling() {
+    local action="${1:-status}" a2="${2:-}" a3="${3:-}" model vals
+    local temp top_k top_p min_p repeat presence src
+
+    case "$action" in
+        status|defaults|reset|apply) model="$a2" ;;
+        temp|top_k|top_p|min_p|repeat_penalty|presence_penalty) model="$a3" ;;
+        *) echo "Usage: ps5llm sampling [status|temp <v>|top_k <v>|top_p <v>|min_p <v>|repeat_penalty <v>|presence_penalty <v>|reset|defaults|apply] [model]"; exit 1 ;;
+    esac
+    [ -n "$model" ] || model=$(get_current_model 2>/dev/null || true)
+    [ -n "$model" ] || { echo "No model specified and no current model set" >&2; exit 1; }
+
+    vals=$(model_sampling_get "$model")
+    temp=$(echo "$vals" | cut -d'|' -f1)
+    top_k=$(echo "$vals" | cut -d'|' -f2)
+    top_p=$(echo "$vals" | cut -d'|' -f3)
+    min_p=$(echo "$vals" | cut -d'|' -f4)
+    repeat=$(echo "$vals" | cut -d'|' -f5)
+    presence=$(echo "$vals" | cut -d'|' -f6)
+    if model_sampling_has_override "$model"; then src="saved override"; else src="model preset"; fi
+
+    if [ "$action" = "status" ]; then
+        echo "Sampling parameters for $(basename "$model"):"
+        echo "  TEMP:             $temp"
+        echo "  TOP_K:            $top_k"
+        echo "  TOP_P:            $top_p"
+        echo "  MIN_P:            $min_p"
+        echo "  REPEAT_PENALTY:   $repeat"
+        echo "  PRESENCE_PENALTY: $presence"
+        echo "  Source:           $src"
+        echo ""
+        echo "Current llama.conf:"
+        echo "  TEMP=$(get_config TEMP) TOP_K=$(get_config TOP_K) TOP_P=$(get_config TOP_P) MIN_P=$(get_config MIN_P)"
+        echo "  REPEAT_PENALTY=$(get_config REPEAT_PENALTY) PRESENCE_PENALTY=$(get_config PRESENCE_PENALTY)"
+        return 0
+    fi
+
+    if [ "$action" = "defaults" ]; then
+        vals=$(model_sampling_defaults "$model")
+        echo "Preset defaults for $(basename "$model"):"
+        echo "  TEMP=$(echo "$vals" | cut -d'|' -f1) TOP_K=$(echo "$vals" | cut -d'|' -f2) TOP_P=$(echo "$vals" | cut -d'|' -f3) MIN_P=$(echo "$vals" | cut -d'|' -f4)"
+        echo "  REPEAT_PENALTY=$(echo "$vals" | cut -d'|' -f5) PRESENCE_PENALTY=$(echo "$vals" | cut -d'|' -f6)"
+        return 0
+    fi
+
+    if [ "$action" = "apply" ]; then
+        apply_model_sampling "$model"
+        echo "Applied sampling for $(basename "$model") to llama.conf:"
+        echo "  TEMP=$(get_config TEMP) TOP_K=$(get_config TOP_K) TOP_P=$(get_config TOP_P) MIN_P=$(get_config MIN_P)"
+        echo "  REPEAT_PENALTY=$(get_config REPEAT_PENALTY) PRESENCE_PENALTY=$(get_config PRESENCE_PENALTY)"
+        echo "Restart llama.cpp for it to take effect."
+        return 0
+    fi
+
+    if [ "$action" = "reset" ]; then
+        model_sampling_reset "$model"
+        vals=$(model_sampling_defaults "$model")
+        temp=$(echo "$vals" | cut -d'|' -f1)
+        top_k=$(echo "$vals" | cut -d'|' -f2)
+        top_p=$(echo "$vals" | cut -d'|' -f3)
+        min_p=$(echo "$vals" | cut -d'|' -f4)
+        repeat=$(echo "$vals" | cut -d'|' -f5)
+        presence=$(echo "$vals" | cut -d'|' -f6)
+        echo "Reset $(basename "$model") to preset defaults:"
+        echo "  TEMP=$temp TOP_K=$top_k TOP_P=$top_p MIN_P=$min_p REPEAT_PENALTY=$repeat PRESENCE_PENALTY=$presence"
+        if [ "$model" = "$(get_current_model)" ]; then
+            apply_model_sampling "$model"
+            if llama_running; then
+                echo "Restarting llama.cpp to apply..."
+                rc-service llama-server restart || cmd_llama_restart
+            else
+                echo "llama.cpp not running - applies on next start."
+            fi
+        else
+            echo "Saved for next load of this model."
+        fi
+        return 0
+    fi
+
+    # temp|top_k|top_p|min_p|repeat_penalty|presence_penalty
+    case "$action" in
+        temp)             validate_sampling_value TEMP             "$a2" || exit 1; temp="$a2" ;;
+        top_k)            validate_sampling_value TOP_K            "$a2" || exit 1; top_k="$a2" ;;
+        top_p)            validate_sampling_value TOP_P            "$a2" || exit 1; top_p="$a2" ;;
+        min_p)            validate_sampling_value MIN_P            "$a2" || exit 1; min_p="$a2" ;;
+        repeat_penalty)   validate_sampling_value REPEAT_PENALTY   "$a2" || exit 1; repeat="$a2" ;;
+        presence_penalty) validate_sampling_value PRESENCE_PENALTY "$a2" || exit 1; presence="$a2" ;;
+    esac
+    model_sampling_set "$model" "$temp" "$top_k" "$top_p" "$min_p" "$repeat" "$presence"
+    echo "Saved sampling for $(basename "$model"):"
+    echo "  TEMP=$temp TOP_K=$top_k TOP_P=$top_p MIN_P=$min_p REPEAT_PENALTY=$repeat PRESENCE_PENALTY=$presence"
+    if [ "$model" = "$(get_current_model)" ]; then
+        apply_model_sampling "$model"
+        if llama_running; then
+            echo "Restarting llama.cpp to apply..."
+            rc-service llama-server restart || cmd_llama_restart
+        else
+            echo "llama.cpp not running - applies on next start."
+        fi
+    else
+        echo "Saved for next load of this model."
+    fi
+}
+
+# ---------- global llama-server launch settings ----------
+settings_keys() {
+    printf '%s\n' HOST PORT THREADS GPU_LAYERS FIT BATCH UBATCH \
+        CTX_CHECKPOINTS CACHE_RAM CACHE_K CACHE_V FLASH_ATTN MMPROJ
+}
+
+settings_desc() {
+    case "$1" in
+        HOST)            echo "listen address" ;;
+        PORT)            echo "HTTP port (dsh uses 8080)" ;;
+        THREADS)         echo "CPU threads (1-32)" ;;
+        GPU_LAYERS)      echo "layers on GPU (999=all)" ;;
+        FIT)             echo "auto-fit args (on/off)" ;;
+        BATCH)           echo "logical batch (1-4096)" ;;
+        UBATCH)          echo "physical batch (1-2048)" ;;
+        CTX_CHECKPOINTS) echo "saved prompt checkpoints (0-16)" ;;
+        CACHE_RAM)       echo "host-RAM prompt cache MiB (0=off)" ;;
+        CACHE_K)         echo "K-cache type" ;;
+        CACHE_V)         echo "V-cache type" ;;
+        FLASH_ATTN)      echo "flash attention (on/off/auto)" ;;
+        MMPROJ)          echo "vision projector path (empty=off)" ;;
+        *)               echo "" ;;
+    esac
+}
+
+settings_usage() {
+    echo "Usage: ps5llm settings [list|get <KEY>|set <KEY> <value>]"
+    echo "Keys:  $(settings_keys | tr '\n' ' ')"
+    echo "Types: CACHE_K/CACHE_V = f32 f16 bf16 q8_0 q4_0 q4_1 q5_0 q5_1 iq4_nl"
+}
+
+settings_int_range() {
+    case "$1" in ''|*[!0-9]*) return 1;; esac
+    [ "$1" -ge "$2" ] 2>/dev/null && [ "$1" -le "$3" ] 2>/dev/null
+}
+
+validate_setting() {
+    local key="$1" value="$2" cur_batch cur_ubatch
+    case "$key" in
+        HOST)
+            case "$value" in ''|*[!A-Za-z0-9.:_-]*) echo "HOST must be an address like 0.0.0.0" >&2; return 1;; esac ;;
+        PORT)
+            settings_int_range "$value" 1 65535 || { echo "PORT must be 1-65535" >&2; return 1; } ;;
+        THREADS)
+            settings_int_range "$value" 1 32 || { echo "THREADS must be 1-32" >&2; return 1; } ;;
+        GPU_LAYERS)
+            settings_int_range "$value" 0 999 || { echo "GPU_LAYERS must be 0-999" >&2; return 1; } ;;
+        FIT)
+            case "$value" in on|off) ;; *) echo "FIT must be on or off" >&2; return 1;; esac ;;
+        BATCH)
+            settings_int_range "$value" 1 4096 || { echo "BATCH must be 1-4096" >&2; return 1; }
+            cur_ubatch=$(get_config UBATCH 2>/dev/null || true); [ -n "$cur_ubatch" ] || cur_ubatch=64
+            [ "$value" -ge "$cur_ubatch" ] || { echo "BATCH must be >= current UBATCH ($cur_ubatch)" >&2; return 1; } ;;
+        UBATCH)
+            settings_int_range "$value" 1 2048 || { echo "UBATCH must be 1-2048" >&2; return 1; }
+            cur_batch=$(get_config BATCH 2>/dev/null || true); [ -n "$cur_batch" ] || cur_batch=256
+            [ "$value" -le "$cur_batch" ] || { echo "UBATCH must be <= current BATCH ($cur_batch)" >&2; return 1; } ;;
+        CTX_CHECKPOINTS)
+            settings_int_range "$value" 0 16 || { echo "CTX_CHECKPOINTS must be 0-16" >&2; return 1; } ;;
+        CACHE_RAM)
+            settings_int_range "$value" 0 65536 || { echo "CACHE_RAM must be 0-65536 (MiB)" >&2; return 1; } ;;
+        CACHE_K|CACHE_V)
+            case "$value" in
+                f32|f16|bf16|q8_0|q4_0|q4_1|q5_0|q5_1|iq4_nl) ;;
+                *) echo "$key must be: f32 f16 bf16 q8_0 q4_0 q4_1 q5_0 q5_1 iq4_nl" >&2; return 1;;
+            esac ;;
+        FLASH_ATTN)
+            case "$value" in on|off|auto) ;; *) echo "FLASH_ATTN must be on, off or auto" >&2; return 1;; esac ;;
+        MMPROJ)
+            [ -z "$value" ] || [ -f "$value" ] || { echo "MMPROJ file not found: $value" >&2; return 1; } ;;
+        *)
+            echo "Unknown setting: $key" >&2; return 1 ;;
+    esac
+    return 0
+}
+
+# Command: settings [list|get <KEY>|set <KEY> <value>]
+cmd_settings() {
+    local action="${1:-list}" key="${2:-}" value="${3:-}" v k
+    case "$action" in
+        list|get|set) ;;
+        *) settings_usage; exit 1 ;;
+    esac
+
+    if [ "$action" = "list" ]; then
+        echo "llama-server launch settings (/etc/llama/llama.conf):"
+        for k in $(settings_keys); do
+            printf '  %-16s %-14s %s\n' "$k" "$(get_config "$k" 2>/dev/null || true)" "$(settings_desc "$k")"
+        done
+        echo ""
+        echo "Use: ps5llm settings set <KEY> <value>"
+        return 0
+    fi
+
+    key=$(echo "$key" | tr 'a-z' 'A-Z')
+    [ -n "$key" ] || { settings_usage; exit 1; }
+    case " $(settings_keys | tr '\n' ' ') " in
+        *" $key "*) ;;
+        *) echo "Unknown setting: $key" >&2; exit 1 ;;
+    esac
+
+    if [ "$action" = "get" ]; then
+        v=$(get_config "$key" 2>/dev/null || true)
+        echo "$key=$v"
+        return 0
+    fi
+
+    validate_setting "$key" "$value" || exit 1
+    set_config "$key" "$value"
+    echo "$key set to: ${value:-(empty)}"
+    case "$key" in
+        PORT) echo "NOTE: dsh and ~/.orchestra/worker.py point at the old port; update them or change this back." ;;
+        HOST) echo "NOTE: binding to 127.0.0.1 makes the server local-only." ;;
+        CACHE_RAM) [ "$value" -gt 0 ] && echo "WARNING: this box has ~2 GiB RAM; a host cache can OOM it." ;;
+    esac
+    if llama_running; then
+        echo "Restarting llama.cpp to apply..."
+        rc-service llama-server restart || cmd_llama_restart
+    else
+        echo "llama.cpp not running - applies on next start."
+    fi
+}
+
+# Helper: VRAM lives on the FAT32 EFI partition (that is what the PS5 loader
+# reads). /boot/efi/vram.txt is authoritative; mirror to /boot/vram.txt when
+# that dir exists so both paths stay in sync.
+vram_read() {
+    for f in /boot/efi/vram.txt /boot/vram.txt; do
+        if [ -f "$f" ]; then cat "$f"; return 0; fi
+    done
+    echo "0x360000000"
+}
+
+vram_write() {
+    local val="$1"
+    local wrote=0 f
+    for f in /boot/efi/vram.txt /boot/vram.txt; do
+        if [ -d "$(dirname "$f")" ]; then
+            if echo "$val" > "$f" 2>/dev/null; then wrote=1;
+            else echo "WARN: cannot write $f (read-only?)" >&2; fi
+        fi
+    done
+    [ "$wrote" -eq 1 ]
+}
+
+# Helper: list GGUF models
+list_models() {
+    if [ -d "$MODELS_DIR" ]; then
+        find "$MODELS_DIR" -name "*.gguf" -type f 2>/dev/null | sort
+    else
+        echo "Models directory not found: $MODELS_DIR"
+    fi
+}
+
+# Helper: validate model file
+validate_model() {
+    local model_path="$1"
+    if [ -f "$model_path" ]; then
+        local size=$(stat -c%s "$model_path" 2>/dev/null || echo "unknown")
+        local readable="(file tool not installed)"
+        if command -v file >/dev/null 2>&1; then
+            readable=$(file "$model_path" 2>/dev/null | head -1)
+        fi
+        echo "Model: $model_path"
+        echo "  Size: $size bytes"
+        echo "  Type: $readable"
+        [ -r "$model_path" ] && echo "  Readable: yes" || echo "  Readable: no"
+    else
+        echo "Error: Model not found: $model_path"
+        return 1
+    fi
+}
+
+# Command: status
+cmd_status() {
+    echo "PS5 LLM Server Status"
+    echo "===================="
+    
+    # System info
+    echo "System:"
+    echo "  Kernel: $(uname -r)"
+    echo "  Alpine: $(cat /etc/alpine-release 2>/dev/null || echo "unknown")"
+    echo "  Uptime: $(uptime -p 2>/dev/null || echo "unknown")"
+    
+    # RAM
+    echo ""
+    echo "RAM:"
+    free -h 2>/dev/null | head -2 || cat /proc/meminfo | grep -E "Mem|Swap" | head -5
+
+    # Live resource snapshot (VRAM / GTT / RAM / llama RSS)
+    echo ""
+    echo "Resources:"
+    mon_snapshot | while IFS='|' read -r name u t; do
+        case "$name" in
+            VRAM|GTT|RAM) echo "  $name: $(fmt_pair "$u" "$t")" ;;
+        esac
+    done
+    
+    # SSH
+    echo ""
+    echo "SSH (OpenSSH):"
+    if ssh_running; then
+        echo "  running (PID: $(pidof sshd 2>/dev/null || echo ?))"
+    else
+        echo "  not running"
+    fi
+
+    # GPU (llama.cpp Vulkan/RADV offloads the model into VRAM)
+    echo ""
+    echo "GPU:"
+    if gpu_ready; then
+        echo "  render node: /dev/dri/renderD128 present"
+        ls /dev/dri/ 2>/dev/null | sed 's/^/  /'
+    else
+        echo "  NOT READY - /dev/dri/renderD128 missing (amdgpu/RADV failed)"
+    fi
+    
+    # LLM
+    echo ""
+    echo "llama.cpp:"
+    if llama_running; then
+        echo "  running (PID: $(pidof "$(basename "$LLAMA_BIN")"))"
+        echo "  Model: $(get_current_model || echo "unknown")"
+        echo "  Port: $(get_config PORT 2>/dev/null || echo "8080")"
+        echo "  Host: $(get_config HOST 2>/dev/null || echo "0.0.0.0")"
+        echo "  Context: $(get_config CONTEXT 2>/dev/null || echo "8192")"
+        echo "  Threads: $(get_config THREADS 2>/dev/null || echo "12")"
+        echo "  GPU layers: $(get_config GPU_LAYERS 2>/dev/null || echo "999") (VRAM offload)"
+    else
+        echo "  not running"
+        echo "  Last model: $(get_current_model || echo "none")"
+    fi
+    
+    # Model listing
+    echo ""
+    echo "Available models:"
+    list_models | while read -r model; do
+        if [ "$model" = "$(get_current_model)" ]; then
+            echo "  [X] $model"
+        else
+            echo "  [ ] $model"
+        fi
+    done
+}
+
+# Command: model list (with per-model context windows)
+cmd_model_list() {
+    echo "Available GGUF models on /models:"
+    echo "============================"
+    list_models | while read -r model; do
+        size=$(stat -c%s "$model" 2>/dev/null || echo "unknown")
+        echo "  $model ($size bytes, ctx $(model_ctx_get "$model"))"
+    done
+    echo ""
+    echo "Current model: $(get_current_model || echo "none")"
+}
+
+# Command: model current
+cmd_model_current() {
+    local current=$(get_current_model)
+    if [ -n "$current" ]; then
+        echo "Current model: $current"
+    else
+        echo "No model currently set"
+    fi
+}
+
+# Command: model set (config only; applies the model's saved context)
+cmd_model_set() {
+    local model_path="$1"
+    if [ -z "$model_path" ]; then
+        echo "Usage: ps5llm model set <path/to/model.gguf>"
+        exit 1
+    fi
+
+    # Validate model
+    validate_model "$model_path" || exit 1
+
+    # Set in config + apply this model's own context window
+    set_config MODEL "$model_path"
+    set_config CONTEXT "$(model_ctx_get "$model_path")"
+    apply_model_sampling "$model_path"
+
+    echo "Model set to: $model_path (ctx=$(model_ctx_get "$model_path"))"
+
+    # Restart llama.cpp if running
+    if llama_running; then
+        echo "Restarting llama.cpp with new model..."
+        rc-service llama-server restart || cmd_llama_restart
+    fi
+}
+
+# Command: model load (UNLOAD running model first, then load + start).
+# This is what the console "Load model" action calls.
+cmd_model_load() {
+    local model_path="$1"
+    if [ -z "$model_path" ]; then
+        echo "Usage: ps5llm model load <path/to/model.gguf>"
+        exit 1
+    fi
+
+    validate_model "$model_path" || exit 1
+
+    # 1. Unload: stop any running instance before touching config.
+    if llama_running; then
+        echo "Unloading current model ($(get_current_model))..."
+        cmd_llama_stop
+        sleep 1
+    fi
+
+    # 2. Select + apply this model's own context window.
+    set_config MODEL "$model_path"
+    set_config CONTEXT "$(model_ctx_get "$model_path")"
+    apply_model_sampling "$model_path"
+    echo "Loading: $model_path (ctx=$(model_ctx_get "$model_path"))"
+
+    # 3. Start serving the new model.
+    cmd_llama_start
+}
+
+# Command: model ctx (per-model context window: get or set)
+cmd_model_ctx() {
+    local model_path="$1" ctx="$2"
+    if [ -z "$model_path" ]; then
+        echo "Usage: ps5llm model ctx <path/to/model.gguf> [size]"
+        echo "  no size  -> show this model's context window"
+        echo "  size     -> one of the fixed ladder (4k to 1M, PS5LM Plus style):"
+        echo "              4096 8192 16384 32768 65536 131072 262144 524288 1048576"
+        exit 1
+    fi
+    if [ -z "$ctx" ]; then
+        echo "$model_path -> ctx=$(model_ctx_get "$model_path")"
+        return 0
+    fi
+    model_ctx_set "$model_path" "$ctx" || exit 1
+    echo "Saved: $model_path -> ctx=$ctx"
+    # Apply immediately if this is the loaded model.
+    if [ "$model_path" = "$(get_current_model)" ]; then
+        set_config CONTEXT "$ctx"
+        if llama_running; then
+            echo "Loaded model changed - restarting llama.cpp to apply ctx=$ctx..."
+            rc-service llama-server restart || cmd_llama_restart
+        fi
+    fi
+}
+
+# Command: model validate
+cmd_model_validate() {
+    local model_path="${1:-$(get_current_model)}"
+    if [ -z "$model_path" ]; then
+        echo "No model specified or set"
+        exit 1
+    fi
+    validate_model "$model_path"
+}
+
+# Command: llama start (GPU-first: full VRAM offload like working Ubuntu setup)
+# Prefers rc-service (supervisor-aware: supervise-daemon owns restarts, so a
+# direct start-stop-daemon launch here would fight the supervisor). The direct
+# path is only for environments without OpenRC (debug shells, containers).
+cmd_llama_start() {
+    if llama_running; then
+        echo "llama.cpp already running (PID: $(pidof "$(basename "$LLAMA_BIN")" 2>/dev/null || echo ?))"
+        return 0
+    fi
+
+    if command -v rc-service >/dev/null 2>&1 && [ -f /etc/init.d/llama-server ]; then
+        rc-service llama-server start
+        return $?
+    fi
+    # Single source of truth for launch flags: the init script (PS5LM-Plus
+    # recipe --fit off, -b 256 -ub 64, --ctx-checkpoints 1, --cache-ram 0).
+    if [ -x /etc/init.d/llama-server ] && [ -x /sbin/openrc-run ]; then
+        /etc/init.d/llama-server start
+        return $?
+    fi
+
+    # Read config
+    local model=$(get_config MODEL)
+    local host=$(get_config HOST)
+    local port=$(get_config PORT)
+    local ctx=$(get_config CONTEXT)
+    local threads=$(get_config THREADS)
+    local gpu_layers=$(get_config GPU_LAYERS)
+    local fit=$(get_config FIT)
+    local batch=$(get_config BATCH)
+    local ubatch=$(get_config UBATCH)
+    local ctxcp=$(get_config CTX_CHECKPOINTS)
+    local cram=$(get_config CACHE_RAM)
+    local cache_k=$(get_config CACHE_K)
+    local cache_v=$(get_config CACHE_V)
+    local fa=$(get_config FLASH_ATTN)
+    local temp=$(get_config TEMP)
+    local top_k=$(get_config TOP_K)
+    local top_p=$(get_config TOP_P)
+    local min_p=$(get_config MIN_P)
+    local repeat_penalty=$(get_config REPEAT_PENALTY)
+    local presence_penalty=$(get_config PRESENCE_PENALTY)
+    : "${host:=0.0.0.0}" "${port:=8080}" "${ctx:=8192}" "${threads:=12}" "${gpu_layers:=999}" "${fit:=off}" "${batch:=256}" "${ubatch:=64}" "${ctxcp:=1}" "${cram:=0}" "${cache_k:=q8_0}" "${cache_v:=q8_0}" "${fa:=on}" \
+        "${temp:=0.6}" "${top_k:=20}" "${top_p:=0.95}" "${min_p:=0.0}" "${repeat_penalty:=1.0}" "${presence_penalty:=0.0}"
+
+    if [ -z "$model" ]; then
+        echo "Error: No model configured"
+        echo "Use: ps5llm model set /path/to/model.gguf"
+        exit 1
+    fi
+
+    # Validate model exists (streamed/mmap'd from SSD - never copied to RAM)
+    if [ ! -f "$model" ]; then
+        echo "Error: Model not found: $model"
+        exit 1
+    fi
+    if [ ! -x "$LLAMA_BIN" ]; then
+        echo "Error: llama.cpp binary missing: $LLAMA_BIN"
+        echo "Rebuild with -DGGML_VULKAN=ON (see docs/LLAMA-VULKAN.md)"
+        exit 1
+    fi
+
+    # A 27B model cannot run on CPU - refuse silent fallback.
+    if ! gpu_ready; then
+        echo "Error: no GPU render node (/dev/dri/renderD128)."
+        echo "Run 'ps5llm gpu status' to diagnose amdgpu/RADV."
+        exit 1
+    fi
+
+    # Kill any previous instance
+    pkill -f "$LLAMA_BIN" 2>/dev/null || true
+    sleep 1
+
+    # Start llama.cpp - full offload into VRAM (-ngl 999, same as Ubuntu setup)
+    echo "Starting llama.cpp (GPU, $gpu_layers layers into VRAM)..."
+    echo "  Model: $model"
+    echo "  Host: $host"
+    echo "  Port: $port"
+    echo "  Context: $ctx"
+    echo "  Threads: $threads"
+    echo "  GPU layers: $gpu_layers"
+
+    start-stop-daemon --start --background --pidfile /run/llama.pid --make-pidfile \
+        --stdout /var/log/llama-server.log --stderr /var/log/llama-server.log \
+        --exec "$LLAMA_BIN" -- \
+        --model "$model" --host "$host" --port "$port" \
+        --ctx-size "$ctx" --threads "$threads" \
+        --temp "$temp" --top-k "$top_k" --top-p "$top_p" --min-p "$min_p" \
+        --repeat-penalty "$repeat_penalty" --presence-penalty "$presence_penalty" \
+        --n-gpu-layers "$gpu_layers" --fit "$fit" \
+        --cache-type-k "$cache_k" --cache-type-v "$cache_v" \
+        --parallel 1 --no-kv-unified --kv-offload --flash-attn "$fa" \
+        --batch-size "$batch" --ubatch-size "$ubatch" \
+        --ctx-checkpoints "$ctxcp" --cache-ram "$cram" \
+        --log-file /var/log/llama-server.log
+
+    # Wait a moment and check (Vulkan shader compile happens in-process,
+    # so pidof is valid even on slow first starts; 3s covers daemon fork)
+    sleep 3
+    if llama_running; then
+        echo "llama.cpp started successfully (PID: $(cat /run/llama.pid 2>/dev/null || pidof "$(basename "$LLAMA_BIN")" 2>/dev/null || echo unknown))"
+    else
+        echo "llama.cpp failed to start - see /var/log/llama-server.log"
+        exit 1
+    fi
+}
+
+# Command: llama stop (rc-service first: only the supervisor's --stop
+# prevents a respawn; killing the daemon directly would just restart it)
+cmd_llama_stop() {
+    if command -v rc-service >/dev/null 2>&1 && [ -f /etc/init.d/llama-server ]; then
+        rc-service llama-server stop
+        return $?
+    fi
+    if llama_running; then
+        echo "Stopping llama.cpp (PID: $(pidof "$(basename "$LLAMA_BIN")"))..."
+        start-stop-daemon --stop --pidfile /run/llama.pid --exec "$LLAMA_BIN" 2>/dev/null || \
+            pkill -f "$LLAMA_BIN" 2>/dev/null || true
+        sleep 2
+        if llama_running; then
+            echo "Force killing llama.cpp..."
+            pkill -9 -f "$LLAMA_BIN" 2>/dev/null || true
+        fi
+        rm -f /run/llama.pid
+        echo "llama.cpp stopped"
+    else
+        echo "llama.cpp not running"
+    fi
+}
+
+# Command: llama restart
+cmd_llama_restart() {
+    cmd_llama_stop
+    sleep 1
+    cmd_llama_start
+}
+
+# Command: vram show (authoritative file is on the EFI partition)
+cmd_vram_show() {
+    local val dec
+    val=$(vram_read)
+    echo "VRAM configuration (effective: $val):"
+    for f in /boot/efi/vram.txt /boot/vram.txt; do
+        if [ -f "$f" ]; then echo "  $f = $(cat "$f")"; fi
+    done
+    # Portable hex display (no =~, no $((16#)) - neither exists on minimal ash)
+    case "$val" in
+        0x*|0X*) dec=$(hex_dec "$val")
+            case "$dec" in ''|*[!0-9]*) ;; *) echo "Decimal: $dec bytes";; esac;;
+    esac
+    echo "Note: the PS5 loader reads the EFI copy; a change needs a reboot."
+}
+
+# VRAM sanity range: 256MB (0x10000000) .. 16GB (0x400000000, PS5 total).
+# Outside this the loader would get a nonsense allocation - refuse loudly.
+# Returns 0 when sane. Pure POSIX awk (values up to 2^34, exact in doubles).
+vram_sane() {
+    # decimals, not 0x literals - POSIX awk has no hex constants.
+    # min 0x10000000 (256MB), max 0x400000000 (16GB = whole PS5 memory).
+    awk -v h="$1" 'BEGIN{h=tolower(h);sub(/^0x/,"",h);
+        if(h==""||h~/[^0-9a-f]/) exit 1;
+        n=0;for(i=1;i<=length(h);i++)n=n*16+index("0123456789abcdef",substr(h,i,1))-1;
+        exit !((n>=268435456)&&(n<=17179869184))}'
+}
+
+# Command: vram edit (writes EFI copy + mirror, validates hex + sanity range)
+cmd_vram_edit() {
+    local new_vram="$1" rest
+    if [ -z "$new_vram" ]; then
+        echo "Usage: ps5llm vram edit <hex_value>"
+        echo "Example: ps5llm vram edit 0x360000000"
+        exit 1
+    fi
+    case "$new_vram" in
+        0x*|0X*) rest=$(echo "$new_vram" | sed 's/^0[xX]//');;
+        *) echo "Must be hex starting with 0x" >&2; exit 1;;
+    esac
+    case "$rest" in
+        ''|*[!0-9a-fA-F]*) echo "Invalid hex: $new_vram" >&2; exit 1;;
+    esac
+    if ! vram_sane "$new_vram"; then
+        echo "Out of sane range [0x10000000..0x400000000]: $new_vram" >&2
+        exit 1
+    fi
+
+    vram_write "$new_vram" || { echo "No writable VRAM path (/boot/efi missing?)" >&2; exit 1; }
+
+    echo "VRAM set to: $new_vram"
+    echo "Note: Requires PS5 reboot to take effect"
+}
+
+# Command: vram default
+cmd_vram_default() {
+    vram_write "0x360000000" || { echo "No writable VRAM path (/boot/efi missing?)" >&2; exit 1; }
+    echo "VRAM reset to default: 0x360000000 (13.5GB)"
+}
+
+# Command: wifi scan (any wireless interface - USB adapters enumerate as
+# wlan*, the onboard moal driver as mlan*)
+cmd_wifi_scan() {
+    local ifaces
+    ifaces=$(wifi_ifaces)
+    echo "WiFi interfaces:"
+    if [ -z "$ifaces" ]; then
+        echo "  none found - is an adapter present? (see 'ps5llm usb list')"
+    else
+        echo "$ifaces" | sed 's/^/  /'
+    fi
+    echo ""
+    echo "Scanning for WiFi networks..."
+    for wlan in $ifaces; do
+        echo "--- $wlan ---"
+        ip link set dev "$wlan" up 2>/dev/null || continue
+        if command -v iw >/dev/null 2>&1; then
+            iw dev "$wlan" scan 2>/dev/null | grep -E '^BSS|SSID:' | head -20 || echo "  scan failed on $wlan"
+        else
+            echo "  'iw' not installed; check dmesg for firmware errors"
+        fi
+    done
+}
+
+# Drop any existing network block for $1 from $2 (strict helpers first):
+# repeated connects must not accumulate stale (wrong-password) blocks that
+# make wpa_supplicant flap between them. Portable awk, no temp-file races
+# with the running supplicant (write new file, then move).
+wpa_remove_ssid() {
+    local ssid="$1" conf="$2" tmp="$2.tmp"
+    [ -f "$conf" ] || return 0
+    awk -v ssid="$ssid" '
+        /^[[:space:]]*network=\{/ { inblock=1; buf=""; hasssid=0 }
+        {
+            if (inblock) buf = buf $0 "\n"
+            else print
+            if (inblock && $0 ~ /^[[:space:]]*ssid=/) {
+                line=$0; sub(/^[[:space:]]*ssid="/,"",line); sub(/".*$/,"",line)
+                if (line == ssid) hasssid=1
+            }
+            if (inblock && $0 ~ /^[[:space:]]*\}/) {
+                if (!hasssid) printf "%s", buf
+                inblock=0
+            }
+        }' "$conf" > "$tmp" && mv "$tmp" "$conf"
+}
+
+# Command: wifi connect (passphrase optional arg for the console UI;
+# without it, wpa_passphrase prompts securely on the terminal)
+cmd_wifi_connect() {
+    local ssid="$1" psk="$2"
+    if [ -z "$ssid" ]; then
+        echo "Usage: ps5llm wifi connect <ssid> [passphrase]"
+        echo "Without passphrase you will be prompted securely."
+        exit 1
+    fi
+
+    local wlan WPA_CONF _st
+    wlan=$(wifi_ifaces | head -1)
+    if [ -z "$wlan" ]; then
+        echo "Error: no wireless interface found (checked wlan*/mlan*/wlp*). See 'ps5llm usb list'."
+        exit 1
+    fi
+
+    echo "Connecting $wlan to WiFi: $ssid"
+
+    WPA_CONF="/etc/wpa_supplicant/wpa_supplicant.conf"
+    mkdir -p /etc/wpa_supplicant
+    touch "$WPA_CONF"
+    chmod 600 "$WPA_CONF"
+
+    # Replace (not append): one block per SSID, newest credentials win.
+    wpa_remove_ssid "$ssid" "$WPA_CONF"
+
+    # wpa_passphrase with an arg is non-interactive (console UI path);
+    # without an arg it prompts securely. Either way only the PSK hash lands
+    # in the config file, and the file is chmod 600.
+    if [ -n "${psk:-}" ]; then
+        wpa_passphrase "$ssid" "$psk" >> "$WPA_CONF" || { echo "Error: failed to write $WPA_CONF" >&2; exit 1; }
+    elif ! wpa_passphrase "$ssid" >> "$WPA_CONF"; then
+        echo "Error: failed to write $WPA_CONF"
+        exit 1
+    fi
+    chmod 600 "$WPA_CONF"
+
+    # Restart the supplicant + DHCP cleanly: stale daemons hold the interface
+    # with old credentials and would fight the new ones.
+    ip link set dev "$wlan" up 2>/dev/null || true
+    pkill -f "wpa_supplicant.*$wlan" 2>/dev/null || true
+    if [ -f "/var/run/udhcpc.$wlan.pid" ]; then
+        kill "$(cat "/var/run/udhcpc.$wlan.pid")" 2>/dev/null || true
+        rm -f "/var/run/udhcpc.$wlan.pid"
+    fi
+    sleep 1
+    if command -v wpa_supplicant >/dev/null 2>&1; then
+        wpa_supplicant -B -i "$wlan" -c "$WPA_CONF" 2>/dev/null || true
+        sleep 3
+        if command -v wpa_cli >/dev/null 2>&1; then
+            _st=$(wpa_cli -i "$wlan" status 2>/dev/null | grep '^wpa_state=' | cut -d= -f2)
+            echo "  wpa state: ${_st:-unknown}"
+        fi
+        # -b: background immediately, keep renewing; never block the caller.
+        udhcpc -b -R -t 5 -T 3 -i "$wlan" -p "/var/run/udhcpc.$wlan.pid" 2>/dev/null || true
+        sleep 2
+    fi
+
+    echo "WiFi connection initiated on $wlan for: $ssid"
+    echo "Check with: ip addr show $wlan"
+}
+
+# Command: reboot
+cmd_reboot() {
+    echo "Rebooting PS5..."
+    /sbin/reboot
+}
+
+# Command: shutdown
+cmd_shutdown() {
+    echo "Shutting down PS5..."
+    /sbin/poweroff
+}
+
+# Command: fan (via ps5-control: /dev/icc needs an ioctl, which shell
+# redirection cannot issue - raw writes would silently do nothing)
+cmd_fan() {
+    local action="$1"
+    case "$action" in
+        on|off|max)
+            if [ -x /usr/bin/ps5-control ]; then
+                /usr/bin/ps5-control --fan "$action"
+            else
+                echo "ps5-control binary missing (/usr/bin/ps5-control not built)" >&2
+                echo "Rebuild the image (build.sh compiles it from ps5-linux-tools)." >&2
+                exit 1
+            fi
+            ;;
+        *)
+            echo "Usage: ps5llm fan on|off|max"
+            exit 1
+            ;;
+    esac
+}
+
+# Command: boost (same ioctl story as fan - needs the ps5-control binary)
+cmd_boost() {
+    local action="$1"
+    case "$action" in
+        on|off)
+            if [ -x /usr/bin/ps5-control ]; then
+                /usr/bin/ps5-control --boost "$action"
+            else
+                echo "ps5-control binary missing (/usr/bin/ps5-control not built)" >&2
+                echo "Rebuild the image (build.sh compiles it from ps5-linux-tools)." >&2
+                exit 1
+            fi
+            ;;
+        *)
+            echo "Usage: ps5llm boost on|off"
+            exit 1
+            ;;
+    esac
+}
+
+# Command: mtp [status|on|off|toggle|knob <1-4>] - speculative MTP switch
+# with a draft-depth knob. MTP (multi-token prediction) only works with a
+# model that actually ships MTP layers (the *-mtp.gguf build). Turning it ON
+# for a plain GGUF makes llama.cpp abort at load with "context type MTP
+# requested but model doesn't contain MTP layers". This flips SPEC_TYPE /
+# SPEC_DRAFT_N_MAX in llama.conf and restarts llama.cpp so the change goes
+# live - no model switch, no SSH.
+#
+# The knob (SPEC_DRAFT_N_MAX -> --spec-draft-n-max) is the number of tokens
+# MTP drafts per step: 1..4, server default 3. Same knob as the TUI MTP
+# screen. The value only takes effect while MTP is ON.
+cmd_mtp() {
+    local action="${1:-status}" cur model st kn level
+
+    case "$action" in
+        status|on|off|toggle|knob) ;;
+        *) echo "Usage: ps5llm mtp [status|on|off|toggle|knob <1-4>]"; exit 1 ;;
+    esac
+
+    cur=$(get_config SPEC_TYPE 2>/dev/null || echo "")
+    [ "$cur" = "draft-mtp" ] && st="ON" || st="OFF"
+    kn=$(get_config SPEC_DRAFT_N_MAX 2>/dev/null || echo "")
+    case "$kn" in 1|2|3|4) ;; *) kn=3 ;; esac
+
+    if [ "$action" = "status" ]; then
+        echo "MTP (speculative decoding): $st"
+        echo "  SPEC_TYPE=${cur:-(empty)}"
+        echo "  Knob (draft tokens per step): $kn  -> --spec-draft-n-max"
+        echo "  Model: $(get_current_model 2>/dev/null || echo none)"
+        echo "  Toggle with: ps5llm mtp on|off|toggle"
+        echo "  Knob with:   ps5llm mtp knob 1|2|3|4  (server default 3)"
+        return 0
+    fi
+
+    if [ "$action" = "knob" ]; then
+        level="${2:-}"
+        case "$level" in 1|2|3|4) ;; *) echo "Usage: ps5llm mtp knob <1-4>" >&2; exit 1 ;; esac
+        set_config SPEC_DRAFT_N_MAX "$level"
+        echo "MTP knob set: $level draft tokens per step (SPEC_DRAFT_N_MAX=$level)."
+        if [ "$st" = "OFF" ]; then
+            echo "Note: MTP is OFF right now; the knob applies once MTP is ON."
+        fi
+        if llama_running; then
+            echo "Restarting llama.cpp to apply..."
+            rc-service llama-server restart || cmd_llama_restart
+        else
+            echo "llama.cpp not running - applies on next start."
+        fi
+        return 0
+    fi
+
+    if [ "$action" = "toggle" ]; then
+        [ "$st" = "ON" ] && action=off || action=on
+    fi
+
+    if [ "$action" = "on" ]; then
+        model=$(get_current_model 2>/dev/null || echo "")
+        case "$model" in
+            *-mtp.gguf) ;;
+            *) echo "WARNING: '$model' does not look like an MTP build." >&2
+               echo "         llama.cpp will abort at load unless it ships MTP layers." >&2 ;;
+        esac
+        set_config SPEC_TYPE draft-mtp
+        echo "MTP enabled (SPEC_TYPE=draft-mtp)."
+    else
+        set_config SPEC_TYPE ""
+        echo "MTP disabled (SPEC_TYPE empty)."
+    fi
+
+    if llama_running; then
+        echo "Restarting llama.cpp to apply..."
+        rc-service llama-server restart || cmd_llama_restart
+    else
+        echo "llama.cpp not running - applies on next start."
+    fi
+}
+
+# Command: reasoning [status|off|auto|on|effort <level>|toggle] - thinking switch.
+# Writes REASONING_MODE (off|on|auto -> --reasoning) and REASONING_EFFORT
+# (-> --reasoning-effort) in llama.conf, then restarts llama.cpp.
+#   off      : no thinking (generic --reasoning off; works for any template)
+#   auto     : let the model's chat template decide (llama default)
+#   on       : force thinking
+#   effort X : force thinking + set effort level for templates that read it
+#              (Swift: minimal/low/medium/high/xhigh/max/default)
+# Ornith and similar only support on/off, so effort levels are ignored there.
+cmd_reasoning() {
+    local action="${1:-status}" level mode eff st b p
+
+    case "$action" in
+        status|off|auto|on|effort|budget|preserve|toggle) ;;
+        *) echo "Usage: ps5llm reasoning [status|off|auto|on|effort <level>|budget <n>|preserve <on|off|auto>|toggle]"; exit 1 ;;
+    esac
+
+    mode=$(get_config REASONING_MODE 2>/dev/null || echo "")
+    eff=$(get_config REASONING_EFFORT 2>/dev/null || echo "")
+    b=$(get_config REASONING_BUDGET 2>/dev/null || echo "")
+    p=$(get_config REASONING_PRESERVE 2>/dev/null || echo "")
+
+    if [ "$mode" = "off" ]; then st="OFF"
+    elif [ -n "$eff" ]; then st="$eff"
+    elif [ "$mode" = "on" ]; then st="ON"
+    else st="auto"; fi
+
+    if [ "$action" = "status" ]; then
+        echo "Thinking/reasoning: $st"
+        echo "  REASONING_MODE=${mode:-(empty=auto)}"
+        echo "  REASONING_EFFORT=${eff:-(empty=template default)}"
+        echo "  REASONING_BUDGET=${b:-(empty=no flag)}"
+        echo "  REASONING_PRESERVE=${p:-(empty=no flag)}"
+        echo "  Model: $(get_current_model 2>/dev/null || echo none)"
+        echo "  Set with: ps5llm reasoning off|auto|on|effort <level>|budget <n>|preserve <on|off|auto>"
+        return 0
+    fi
+
+    if [ "$action" = "toggle" ]; then
+        [ "$mode" = "off" ] && action=auto || action=off
+    fi
+
+    case "$action" in
+        off)  set_config REASONING_MODE off;  set_config REASONING_EFFORT ""
+              echo "Thinking OFF." ;;
+        auto) set_config REASONING_MODE auto; set_config REASONING_EFFORT ""
+              echo "Thinking AUTO (model template default)." ;;
+        on)   set_config REASONING_MODE on;   set_config REASONING_EFFORT ""
+              echo "Thinking ON (forced)." ;;
+        effort)
+              level="${2:-}"
+              case "$level" in
+                  default|minimal|low|medium|high|xhigh|max) ;;
+                  *) echo "Usage: ps5llm reasoning effort <default|minimal|low|medium|high|xhigh|max>"; exit 1 ;;
+              esac
+              set_config REASONING_MODE on
+              set_config REASONING_EFFORT "$level"
+              echo "Thinking effort set to '$level' (thinking ON)." ;;
+        budget)
+              level="${2:-}"
+              case "$level" in
+                  -1) ;;
+                  ''|*[!0-9]*) echo "Usage: ps5llm reasoning budget <-1|0-1048576> (-1 = no limit)" >&2; exit 1 ;;
+              esac
+              [ "$level" = "-1" ] || [ "$level" -le 1048576 ] || { echo "Budget must be -1 or 0-1048576" >&2; exit 1; }
+              set_config REASONING_BUDGET "$level"
+              echo "Reasoning budget set to $level tokens." ;;
+        preserve)
+              level="${2:-}"
+              case "$level" in
+                  on|off|auto) ;;
+                  *) echo "Usage: ps5llm reasoning preserve <on|off|auto>" >&2; exit 1 ;;
+              esac
+              if [ "$level" = "auto" ]; then
+                  set_config REASONING_PRESERVE ""
+              else
+                  set_config REASONING_PRESERVE "$level"
+              fi
+              echo "Reasoning preserve set to $level." ;;
+    esac
+
+    if llama_running; then
+        echo "Restarting llama.cpp to apply..."
+        rc-service llama-server restart || cmd_llama_restart
+    else
+        echo "llama.cpp not running - applies on next start."
+    fi
+}
+
+# Command: memory
+cmd_memory() {
+    echo "Memory usage:"
+    cat /proc/meminfo 2>/dev/null | grep -E "MemTotal|MemFree|MemAvailable|SwapTotal|SwapFree|Buffers|Cached" | while read -r line; do
+        echo "  $line"
+    done
+    
+    echo ""
+    echo "Process memory (llama.cpp):"
+    # NOTE the `|| true`: pidof exits nonzero when nothing matches, and a
+    # bare `local x=$(pidof...)` would trip set -e and kill the whole command.
+    local llama_pid=$(pidof "$(basename "$LLAMA_BIN")" 2>/dev/null || true)
+    if [ -n "$llama_pid" ]; then
+        cat /proc/"$llama_pid"/status 2>/dev/null | grep -E "VmRSS|VmHWM|Name" || echo "  Cannot read process memory"
+    else
+        echo "  llama.cpp not running"
+    fi
+    echo ""
+    echo "VRAM allocation (boot-time, EFI copy): $(vram_read 2>/dev/null || echo "unknown")"
+    echo "Note: on this appliance the model lives in VRAM via Vulkan/RADV"
+    echo "unified memory - 'free' will not show it as a separate GPU pool."
+}
+
+# ---------- live resource monitor (VRAM / GTT / RAM / llama RSS) ----------
+# Sources: amdgpu sysfs (bytes) + /proc/meminfo (kB). No daemons, no extra
+# packages - a sleeping shell loop, ~0 CPU/RAM. This is the OOM early warning.
+
+# first drm card with amdgpu memory info, or empty
+mon_card() {
+    for d in /sys/class/drm/card*/device; do
+        if [ -r "$d/mem_info_vram_total" ]; then echo "$d"; return 0; fi
+    done
+    echo ""
+}
+
+mon_sysfs() { [ -r "$1" ] && cat "$1" 2>/dev/null || echo ""; }
+fmt_gb() { awk -v b="${1:-0}" 'BEGIN{printf "%.1f", b/1024/1024/1024}'; }
+mem_kb() { awk -v k="$1" '$1==k":" {print $2; exit}' /proc/meminfo 2>/dev/null || echo ""; }
+
+# hex like 0x360000000 -> decimal, pure POSIX awk (no $((16#)) - not portable)
+hex_dec() {
+    echo "$1" | awk '{h=tolower($0);sub(/^0x/,"",h);
+        if(h==""){print "";exit};n=0;
+        for(i=1;i<=length(h);i++){c=substr(h,i,1);v=index("0123456789abcdef",c)-1;
+        if(v<0){print "";exit};n=n*16+v}print n}'
+}
+
+llama_rss_kb() {
+    local total=0 p rss
+    # `|| true`: no match (or no pidof) must yield 0, never abort the monitor.
+    for p in $(pidof llama-server 2>/dev/null || true); do
+        rss=$(awk '/^VmRSS:/ {print $2; exit}' /proc/"$p"/status 2>/dev/null)
+        case "$rss" in ''|*[!0-9]*) ;; *) total=$((total + rss));; esac
+    done
+    echo "$total"
+}
+
+# snapshot lines: NAME|used_bytes|total_bytes (either may be empty)
+mon_snapshot() {
+    local card used total mt ma
+    card=$(mon_card)
+    if [ -n "$card" ]; then
+        echo "VRAM|$(mon_sysfs "$card/mem_info_vram_used")|$(mon_sysfs "$card/mem_info_vram_total")"
+        echo "GTT|$(mon_sysfs "$card/mem_info_gtt_used")|$(mon_sysfs "$card/mem_info_gtt_total")"
+    else
+        # GPU driver down: total falls back to the configured VRAM allocation.
+        total="$(hex_dec "$(vram_read 2>/dev/null)")"
+        case "$total" in ''|*[!0-9]*) total="";; esac
+        echo "VRAM||$total"
+        echo "GTT||"
+    fi
+    mt=$(mem_kb MemTotal); ma=$(mem_kb MemAvailable)
+    case "$mt" in ''|*[!0-9]*) mt=0;; esac
+    case "$ma" in ''|*[!0-9]*) ma=0;; esac
+    echo "RAM|$(( (mt - ma) * 1024 ))|$(( mt * 1024 ))"
+    echo "LLAMA|$(( $(llama_rss_kb) * 1024 ))|"
+    echo "AVAIL|$(( ma * 1024 ))|"
+}
+
+# used/total bytes -> "9.6/13.5GB", "-/13.5GB", "9.6GB" or "n/a"
+fmt_pair() {
+    local u="" t=""
+    case "$1" in ''|*[!0-9]*) ;; *) u=$(fmt_gb "$1");; esac
+    case "$2" in ''|*[!0-9]*) ;; *) t=$(fmt_gb "$2");; esac
+    if [ -n "$u" ] && [ -n "$t" ]; then echo "$u/$t""GB"
+    elif [ -n "$t" ]; then echo "-/$t""GB"
+    elif [ -n "$u" ]; then echo "$u""GB"
+    else echo "n/a"; fi
+}
+
+# 12-char bar + pct, e.g. "####------  38%"; n/a when inputs aren't numbers
+mon_bar() {
+    case "$1" in ''|*[!0-9]*) echo "------------  n/a"; return 0;; esac
+    case "$2" in ''|*[!0-9]*|0) echo "------------  n/a"; return 0;; esac
+    awk -v u="$1" -v t="$2" 'BEGIN{
+        p=(u*100)/t; if(p>100)p=100; n=int(p*12/100+0.5); s="";
+        for(i=0;i<12;i++) s=s (i<n?"#":"-");
+        printf "%s %3d%%", s, p}'
+}
+
+# overall state from MemAvailable (+ VRAM fullness when known)
+mon_state() {
+    local avail_kb="$1" vu="$2" vt="$3"
+    case "$avail_kb" in ''|*[!0-9]*) avail_kb=0;; esac
+    if [ "$avail_kb" -lt 524288 ]; then echo "CRITICAL - OOM RISK"; return 0; fi
+    case "$vu" in ''|*[!0-9]*) ;; *)
+        case "$vt" in ''|*[!0-9]*|0) ;; *)
+            if awk -v u="$vu" -v t="$vt" 'BEGIN{if(t>0) exit !((u*100)/t>=95); else exit 1}'; then
+                echo "VRAM FULL (spilling to GTT/RAM)"; return 0
+            fi;; esac;; esac
+    if [ "$avail_kb" -lt 1048576 ]; then echo "LOW"; return 0; fi
+    echo "OK"
+}
+
+mon_draw() {
+    local vram_u="" vram_t="" gtt_u="" gtt_t="" ram_u="" ram_t="" llama_u="" avail="" line
+    while IFS='|' read -r name u t; do
+        case "$name" in
+            VRAM) vram_u="$u"; vram_t="$t";;
+            GTT) gtt_u="$u"; gtt_t="$t";;
+            RAM) ram_u="$u"; ram_t="$t";;
+            LLAMA) llama_u="$u";;
+            AVAIL) avail="$u";;
+        esac
+    done <<SNAP
+$(mon_snapshot)
+SNAP
+    local avail_kb=$(( ${avail:-0} / 1024 ))
+    local state
+    state=$(mon_state "$avail_kb" "$vram_u" "$vram_t")
+    local col="" rst=""
+    if [ -t 1 ] && [ "${TERM:-}" != "dumb" ]; then
+        case "$state" in
+            CRITICAL*) col=$(printf '\033[1;31m');;
+            LOW|VRAM*) col=$(printf '\033[1;33m');;
+            *) col=$(printf '\033[1;32m');;
+        esac
+        rst=$(printf '\033[0m')
+    fi
+    echo "PS5 LLM resources  $(date '+%H:%M:%S')"
+    echo "VRAM  $(fmt_pair "$vram_u" "$vram_t")  $(mon_bar "$vram_u" "$vram_t")"
+    echo "GTT   $(fmt_pair "$gtt_u" "$gtt_t")  $(mon_bar "$gtt_u" "$gtt_t")"
+    echo "RAM   $(fmt_pair "$ram_u" "$ram_t")  avail $(fmt_gb "$avail")GB"
+    if [ -n "$llama_u" ] && [ "$llama_u" != "0" ]; then
+        echo "LLAMA $(fmt_gb "$llama_u")GB RSS"
+    else
+        echo "LLAMA not running"
+    fi
+    echo "STATE ${col}${state}${rst}"
+}
+
+# Command: mon [live|once] - live loop redraws every 2s, quits on a single
+# q (no Enter needed). The tty is switched to non-canonical mode so one
+# keypress registers immediately; settings are always restored on exit.
+cmd_mon() {
+    local mode="${1:-live}"
+    if [ "$mode" = "once" ] || [ ! -t 1 ]; then mon_draw; return 0; fi
+    local stty_saved=""
+    stty_saved=$(stty -g < /dev/tty 2>/dev/null || true)
+    mon_restore() { [ -n "$stty_saved" ] && stty "$stty_saved" < /dev/tty 2>/dev/null || true; }
+    trap 'mon_restore' EXIT HUP INT TERM
+    if [ -n "$stty_saved" ]; then stty -icanon min 1 time 20 < /dev/tty 2>/dev/null || true; fi
+    while true; do
+        printf '\033[H\033[2J'
+        mon_draw
+        printf '\n[q]uit (single key, no Enter) '
+        local key=""
+        IFS= read -r -n 1 key < /dev/tty 2>/dev/null || true
+        case "$key" in q|Q) echo ""; mon_restore; trap - EXIT HUP INT TERM; return 0;; esac
+    done
+}
+
+# Command: gpu status|vulkan|test
+cmd_gpu_status() {
+    echo "GPU status (amdgpu + Vulkan/RADV, required for VRAM offload)"
+    echo "============================================================="
+    echo "Render nodes:"
+    ls -la /dev/dri/ 2>/dev/null || echo "  /dev/dri missing - amdgpu driver not loaded"
+    echo ""
+    echo "Kernel driver:"
+    lsmod 2>/dev/null | grep -E '^amdgpu|^drm' || dmesg 2>/dev/null | grep -iE 'amdgpu|drm' | tail -5 || echo "  unknown"
+    echo ""
+    echo "Vulkan ICD:"
+    ls /usr/share/vulkan/icd.d/ 2>/dev/null || echo "  no ICD files (mesa-vulkan-ati missing?)"
+    echo "  RADV_DEBUG=$RADV_DEBUG"
+    echo "  VK_ICD_FILENAMES=$VK_ICD_FILENAMES"
+    echo ""
+    if command -v vulkaninfo >/dev/null 2>&1; then
+        echo "Vulkan devices:"
+        vulkaninfo --summary 2>/dev/null | grep -E 'deviceName|driverID|deviceType' | head -10 || echo "  vulkaninfo found no devices"
+    else
+        echo "vulkan-tools not installed; install it to run vulkaninfo"
+    fi
+}
+
+cmd_gpu_test() {
+    echo "GPU smoke test: asking llama.cpp to enumerate Vulkan devices..."
+    if [ ! -x "$LLAMA_BIN" ]; then
+        echo "Missing binary: $LLAMA_BIN"
+        exit 1
+    fi
+    if ! gpu_ready; then
+        echo "FAIL: /dev/dri/renderD128 missing"
+        exit 1
+    fi
+    "$LLAMA_BIN" --list-devices 2>&1 | head -20 || \
+        echo "(this llama.cpp build has no --list-devices; start the server and check the log for 'ggml_vulkan: Found N Vulkan devices')"
+}
+
+# Command: usb list
+cmd_usb_list() {
+    echo "USB devices:"
+    if command -v lsusb >/dev/null 2>&1; then
+        lsusb
+    else
+        echo "  (usbutils not installed)"
+        ls /sys/bus/usb/devices/ 2>/dev/null | sed 's/^/  /'
+    fi
+    echo ""
+    echo "Network interfaces (wlan* = USB wifi, mlan* = onboard wifi):"
+    ls /sys/class/net/ 2>/dev/null | sed 's/^/  /'
+    echo ""
+    echo "Recent USB/wifi kernel messages (missing firmware shows up here):"
+    dmesg 2>/dev/null | grep -iE 'usb|firmware|wlan|rtl|mt76|ath9k|rt2800' | tail -15 || echo "  dmesg unavailable"
+}
+
+# Command: ssh status|add-key
+cmd_ssh_status() {
+    echo "SSH (OpenSSH):"
+    if ssh_running; then
+        echo "  running (PID: $(pidof sshd 2>/dev/null || echo ?))"
+    else
+        echo "  not running"
+    fi
+    echo "  Host keys:"
+    ls -la /etc/ssh/ssh_host_* 2>/dev/null | sed 's/^/  /' || echo "  none - will generate on service start"
+    echo "  Root authorized_keys: $([ -f /root/.ssh/authorized_keys ] && echo "present ($(wc -l < /root/.ssh/authorized_keys) key(s))" || echo "MISSING - see 'ps5llm ssh add-key'")"
+    echo "  Config: PermitRootLogin prohibit-password, PasswordAuthentication no"
+}
+
+cmd_ssh_add_key() {
+    local key="$1"
+    if [ -z "$key" ]; then
+        echo "Usage: ps5llm ssh add-key '<ssh-ed25519 ...>'"
+        echo "   or: ps5llm ssh add-key /path/to/key.pub"
+        exit 1
+    fi
+    mkdir -p /root/.ssh
+    chmod 700 /root/.ssh
+    if [ -f "$key" ]; then
+        cat "$key" >> /root/.ssh/authorized_keys
+    else
+        echo "$key" >> /root/.ssh/authorized_keys
+    fi
+    chmod 600 /root/.ssh/authorized_keys
+    echo "Key added. Test from your PC before closing this session."
+}
+
+# Main dispatch
+case "${1:-}" in
+    status)           cmd_status ;;
+    model)            shift; case "${1:-list}" in
+                          list) cmd_model_list ;;
+                          current) cmd_model_current ;;
+                          set) shift; cmd_model_set "${1:-}" ;;
+                          load) shift; cmd_model_load "${1:-}" ;;
+                          ctx) shift; cmd_model_ctx "${1:-}" "${2:-}" ;;
+                          validate) shift; cmd_model_validate "${1:-}" ;;
+                          *) echo "Usage: ps5llm model [list|current|set <path>|load <path>|ctx <path> [size]|validate [path]]"; exit 1 ;;
+                      esac ;;
+    llama)            shift; case "${1:-status}" in
+                          start) cmd_llama_start ;;
+                          stop) cmd_llama_stop ;;
+                          restart) cmd_llama_restart ;;
+                          status) llama_running && echo "llama.cpp running (PID: $(pidof "$(basename "$LLAMA_BIN")"))" || echo "llama.cpp not running" ;;
+                          *) echo "Usage: ps5llm llama [start|stop|restart|status]"; exit 1 ;;
+                      esac ;;
+    vram)             shift; case "${1:-show}" in
+                          show) cmd_vram_show ;;
+                          edit) shift; cmd_vram_edit "${1:-}" ;;
+                          default) cmd_vram_default ;;
+                          *) echo "Usage: ps5llm vram [show|edit <hex>|default]"; exit 1 ;;
+                      esac ;;
+    wifi)             shift; case "${1:-scan}" in
+                          scan) cmd_wifi_scan ;;
+                          connect) shift; cmd_wifi_connect "${1:-}" "${2:-}" ;;
+                          *) echo "Usage: ps5llm wifi [scan|connect <ssid> [passphrase]]"; exit 1 ;;
+                      esac ;;
+    gpu)              shift; case "${1:-status}" in
+                          status) cmd_gpu_status ;;
+                          test) cmd_gpu_test ;;
+                          vulkan) cmd_gpu_status ;;
+                          *) echo "Usage: ps5llm gpu [status|test]"; exit 1 ;;
+                      esac ;;
+    usb)              cmd_usb_list ;;
+    mon)              shift; cmd_mon "${1:-live}" ;;
+    ssh)              shift; case "${1:-status}" in
+                          status) cmd_ssh_status ;;
+                          add-key) shift; cmd_ssh_add_key "${1:-}" ;;
+                          *) echo "Usage: ps5llm ssh [status|add-key '<key>|/path']"; exit 1 ;;
+                      esac ;;
+    fan)              shift; cmd_fan "${1:-}" ;;
+    boost)            shift; cmd_boost "${1:-}" ;;
+    mtp)              shift; cmd_mtp "${1:-status}" "${2:-}" ;;
+    reasoning)        shift; cmd_reasoning "${1:-status}" "${2:-}" ;;
+    sampling)         shift; cmd_sampling "${1:-status}" "${2:-}" "${3:-}" ;;
+    settings)         shift; cmd_settings "${1:-list}" "${2:-}" "${3:-}" ;;
+    memory)           cmd_memory ;;
+    reboot)           cmd_reboot ;;
+    shutdown)         cmd_shutdown ;;
+    *)
+        echo "PS5 LLM Administration CLI"
+        echo "============================="
+        echo "Usage: ps5llm <command>"
+        echo ""
+        echo "Commands:"
+        echo "  status                  Show system + llama.cpp + GPU status"
+        echo "  model                   Model management (per-model context)"
+        echo "    list      - List GGUF models on /models"
+        echo "    current - Show current model"
+        echo "    set <path> - Set model (config only, keeps saved ctx)"
+        echo "    load <path> - Unload running model, load + start this one"
+        echo "    ctx <path> [size] - Show/set this model's context window"
+        echo "  llama [start|stop|restart|status]  llama.cpp (GPU/VRAM offload)"
+        echo "  gpu [status|test]       amdgpu/Vulkan/RADV diagnostics"
+        echo "  mon [live|once]         Live VRAM/GTT/RAM monitor (OOM watch)"
+        echo "  usb                     List USB devices + wifi interfaces"
+        echo "  ssh [status|add-key]    OpenSSH status / add root key"
+        echo "  vram [show|edit|default]  VRAM configuration"
+        echo "    show    - Show current VRAM value"
+        echo "    edit <val> - Edit VRAM (requires reboot)"
+        echo "    default - Reset to 13.5GB default"
+        echo "  wifi [scan|connect <ssid> [passphrase]]  USB WiFi management"
+        echo "  fan on|off|max          Fan control"
+        echo "  boost on|off            CPU/GPU boost"
+        echo "  mtp [on|off|toggle|status]  Speculative MTP decoding switch"
+        echo "  reasoning [off|auto|on|effort <level>|budget <n>|preserve <on|off|auto>]"
+        echo "                          Thinking switch / effort / budget / preserve"
+        echo "  sampling [status|temp <v>|top_k <v>|top_p <v>|min_p <v>|repeat_penalty <v>|presence_penalty <v>|reset|defaults]"
+        echo "                          Per-model sampling (TEMP/TOP_K/TOP_P/MIN_P + penalties)"
+        echo "  settings [list|get <KEY>|set <KEY> <value>]  Server launch settings"
+        echo "                          PORT/HOST/THREADS/GPU_LAYERS/BATCH/UBATCH/cache/..."
+        echo "  memory                  Show memory usage"
+        echo "  reboot                  Reboot PS5"
+        echo "  shutdown                Shutdown PS5"
+        exit 1
+        ;;
+esac

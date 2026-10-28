@@ -1,0 +1,20 @@
+#!/sbin/openrc-run
+
+name="ps5-stage-firmware"
+description="Stage PS5 NXP IW620 wifi firmware from EFI partition"
+
+depend() {
+    # Must run AFTER localmount: the firmware blob lives on the FAT32 EFI
+    # partition (/boot/efi), which is only mounted then. In sysinit the
+    # copy always failed and moal probed without firmware (no mlan0).
+    need localmount
+    after localmount
+    before modules
+    before networking
+}
+
+start() {
+    ebegin "Staging PS5 NXP IW620 wifi firmware"
+    /usr/local/sbin/ps5-stage-firmware
+    eend $?
+}

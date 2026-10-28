@@ -1,0 +1,769 @@
+#!/bin/sh
+# ps5llm-tui - barebones terminal control panel for the LOCAL console.
+#
+# Runs on tty1 (HDMI framebuffer) via init, so the server can be driven from
+# the server side: pick a model, set per-model context, manage WiFi, start /
+# stop / restart llama.cpp, change VRAM - all without SSH.
+#
+# RAM cost: one transient `dialog` process (~2-4 MB) only while a box is on
+# screen, zero when closed. No X11/Wayland/compositor/desktop - ever.
+# Falls back to plain numbered menus if `dialog` is not installed.
+#
+# Everything here drives the same backend as `ps5llm` (SSH path), so local
+# and remote control can never disagree about state.
+set -eu
+
+CONFIG_FILE=/etc/llama/llama.conf
+MODELS_CONF=/etc/llama/models.conf
+MODELS_DIR=/models
+DEFAULT_CTX=8192
+TITLE="PS5LLM alpine (MeatThrob edition)"
+
+have_dialog() { command -v dialog >/dev/null 2>&1; }
+
+# ---------- tiny config backend (mirrors ps5llm) ----------
+
+ensure_conf() {
+    mkdir -p /etc/llama
+    [ -f "$CONFIG_FILE" ] || printf '%s\n' \
+        'MODEL=/models/iq3-27b.gguf' 'HOST=0.0.0.0' 'PORT=8080' \
+        'CONTEXT=8192' 'THREADS=12' 'GPU_LAYERS=999' > "$CONFIG_FILE"
+    [ -f "$MODELS_CONF" ] || printf '%s\n' \
+        '# per-model context sizes: <absolute .gguf path>|<ctx>' \
+        '# edited by the Model menu / `ps5llm model ctx` - safe to hand-edit' > "$MODELS_CONF"
+}
+
+cfg_get() { grep "^$1=" "$CONFIG_FILE" 2>/dev/null | cut -d= -f2- | tail -1; }
+cfg_set() {
+    grep -v "^$1=" "$CONFIG_FILE" 2>/dev/null > "$CONFIG_FILE.tmp" || true
+    mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+    echo "$1=$2" >> "$CONFIG_FILE"
+}
+
+# Per-model context: each model remembers its own window size.
+model_ctx_get() {
+    c=$(grep -F "$1|" "$MODELS_CONF" 2>/dev/null | cut -d'|' -f2 | tail -1)
+    [ -n "${c:-}" ] && echo "$c" || echo "$DEFAULT_CTX"
+}
+model_ctx_set() {
+    grep -vF "$1|" "$MODELS_CONF" 2>/dev/null > "$MODELS_CONF.tmp" || true
+    mv "$MODELS_CONF.tmp" "$MODELS_CONF"
+    echo "$1|$2" >> "$MODELS_CONF"
+}
+
+# Fixed context ladder (PS5LM Plus style): context is a knob, not free text.
+# The app's planner picks from a fixed power-of-two list (4096 .. 131072);
+# this is the same ladder extended to 1048576 for huge-window models. All
+# values are multiples of 256 (llama's --ctx-size granularity), so the
+# effective n_ctx equals the chosen value exactly. Existing non-ladder
+# values (e.g. a model's factory window) stay readable and loadable.
+CTX_LADDER="4096 8192 16384 32768 65536 131072 262144 524288 1048576"
+
+ctx_label() { # $1=tokens -> short human label
+    case "$1" in
+        1048576) echo "1M" ;;
+        524288)  echo "512k" ;;
+        262144)  echo "256k" ;;
+        *)       echo "$(( $1 / 1024 ))k" ;;
+    esac
+}
+
+ctx_pick() { # $1=current value $2=prompt -> echo chosen value, or return 1
+    _ccur="$1"
+    for v in $CTX_LADDER; do
+        if [ "$v" = "$_ccur" ]; then printf '%s|%s (now)\n' "$v" "$(ctx_label "$v")"
+        else printf '%s|%s\n' "$v" "$(ctx_label "$v")"; fi
+    done | pick_one "$2"
+}
+
+list_models() { find "$MODELS_DIR" -name '*.gguf' -type f 2>/dev/null | sort; }
+
+llama_running() { pidof llama-server >/dev/null 2>&1; }
+
+# Wireless interfaces by any name: USB adapters come up as wlan*, the
+# onboard NXP/moal driver uses sta_name=mlan -> mlan*, systemd-style
+# names look like wlp*. Prefers `iw dev`, falls back to sysfs globs.
+wifi_ifaces() {
+    {
+        if command -v iw >/dev/null 2>&1; then
+            iw dev 2>/dev/null | awk '$1=="Interface"{print $2}'
+        fi
+        ls /sys/class/net/ 2>/dev/null | grep -E '^(wlan|mlan|wlp)' || true
+    } | grep -v '^$' | sort -u
+}
+
+# Status snapshot for the main menu header. Redrawn every time the menu
+# is shown (i.e. after every action), so it is always current without any
+# background refresh loop that could trap input. Plain text, no colors.
+stats_block() {
+    srv="STOPPED"; llama_running && srv="RUNNING"
+    mdl=$(basename "$(cfg_get MODEL)" 2>/dev/null || echo none)
+    {
+        echo "--- status ---"
+        ps5llm mon once 2>/dev/null | sed -n '2,6p'
+        echo "Server: $srv   Model: $mdl"
+    } 2>/dev/null
+}
+
+vram_boot_mount() {
+    # The kexec loader reads vram.txt from the FAT32 BOOT partition (sdb1),
+    # NOT from ext4 shadows. /boot/efi is often unmounted -> ensure the real
+    # partition is mounted before any VRAM read/write.
+    mountpoint -q /boot/efi 2>/dev/null && return 0
+    mount LABEL=BOOT /boot/efi 2>/dev/null || mount /dev/sdb1 /boot/efi 2>/dev/null || true
+}
+vram_get() {
+    vram_boot_mount
+    for f in /boot/efi/vram.txt /boot/vram.txt; do
+        [ -f "$f" ] && { cat "$f"; return 0; }
+    done
+    echo "0x360000000"
+}
+vram_set() {
+    vram_boot_mount
+    for f in /boot/efi/vram.txt /boot/vram.txt; do
+        if [ -d "$(dirname "$f")" ]; then echo "$1" > "$f"; fi
+    done
+    sync
+}
+
+# ---------- UI primitives (dialog, or plain text fallback) ----------
+
+msg() { # $1=text (\n escapes are interpreted in both modes)
+    if have_dialog; then
+        dialog --backtitle "$TITLE" --title "Info" --msgbox "$1" 0 0
+    else
+        # shellcheck disable=SC2059
+        printf '\n%b\n\n[Enter] ' "$1"; IFS= read -r _ < /dev/tty
+    fi
+}
+
+yesno() { # $1=text -> return 0=yes
+    if have_dialog; then
+        dialog --backtitle "$TITLE" --title "Confirm" --yesno "$1" 0 0
+    else
+        # shellcheck disable=SC2059
+        printf '\n%b [y/N] ' "$1"; IFS= read -r a < /dev/tty
+        [ "$a" = "y" ] || [ "$a" = "Y" ]
+    fi
+}
+
+# NOTE: typed input deliberately does NOT use dialog --inputbox /
+# --passwordbox. Menus (arrow keys) work on this framebuffer but dialog's
+# text-entry widgets never accept keystrokes here, so all typed input goes
+# through direct /dev/tty reads: kernel line discipline gives working
+# backspace, no curses involved, nothing to get stuck in.
+ask_text() { # $1=prompt $2=default -> echo answer (visible typing)
+    printf '\n%s [%s]: ' "$1" "$2" > /dev/tty
+    IFS= read -r a < /dev/tty || a=""
+    if [ -n "$a" ]; then printf '%s' "$a"; else printf '%s' "$2"; fi
+}
+
+ask_secret() { # $1=prompt -> echo answer (hidden typing)
+    printf '\n%s (hidden - nothing shows while typing): ' "$1" > /dev/tty
+    stty -echo < /dev/tty 2>/dev/null || true
+    IFS= read -r a < /dev/tty || a=""
+    stty echo < /dev/tty 2>/dev/null || true
+    printf '\n' > /dev/tty
+    printf '%s' "$a"
+}
+
+# menu_from_stdin: lines "tag|item" on stdin, $1=prompt -> echo tag.
+# Tags travel through a temp index file (odd lines = tags, even = items),
+# never eval - SSIDs and filenames may contain quotes, $, backticks or
+# spaces without breaking anything. (A literal | inside data would split;
+# GGUF names and real-world SSIDs don't use it.)
+pick_one() {
+    _pp="$1"
+    _idx=$(mktemp /tmp/ps5pick.XXXXXX) || return 1
+    _n=0
+    while IFS= read -r _line; do
+        _n=$((_n+1))
+        printf '%s\n' "$_line" | cut -d'|' -f1 >> "$_idx"
+        printf '%s\n' "$_line" | cut -d'|' -f2- >> "$_idx"
+    done
+    if [ "$_n" -le 0 ]; then rm -f "$_idx"; return 1; fi
+    _get() { sed -n "${1}p" "$_idx"; }
+    if have_dialog; then
+        set --; _i=1
+        while [ "$_i" -le "$_n" ]; do
+            set -- "$@" "$_i" "$(_get $((_i*2)))"
+            _i=$((_i+1))
+        done
+        # Cancel/ESC returns 1 (back to the menu). No timeouts anywhere:
+        # every dialog waits for you for as long as you need.
+        _c=$(dialog --stdout --backtitle "$TITLE" --title "Select" --menu "$_pp" 0 0 0 "$@" 2>/dev/tty) || { rm -f "$_idx"; return 1; }
+        case "$_c" in ''|*[!0-9]*) rm -f "$_idx"; return 1;; esac
+        [ "$_c" -ge 1 ] 2>/dev/null && [ "$_c" -le "$_n" ] 2>/dev/null || { rm -f "$_idx"; return 1; }
+        _get $(( _c * 2 - 1 )); _rc=$?
+        rm -f "$_idx"; return $_rc
+    else
+        _i=1
+        while [ "$_i" -le "$_n" ]; do
+            printf '  %d) %s\n' "$_i" "$(_get $((_i*2)))" > /dev/tty
+            _i=$((_i+1))
+        done
+        printf '\n%s [1-%d, 0=cancel]: ' "$_pp" "$_n" > /dev/tty
+        IFS= read -r _c < /dev/tty
+        { [ "$_c" -gt 0 ] 2>/dev/null && [ "$_c" -le "$_n" ] 2>/dev/null; } || { rm -f "$_idx"; return 1; }
+        _get $(( _c * 2 - 1 )); _rc=$?
+        rm -f "$_idx"; return $_rc
+    fi
+}
+
+# ---------- actions ----------
+
+do_load_model() { # $1=path : unload running model, then load selected one
+    model="$1"
+    ctx=$(model_ctx_get "$model")
+    if llama_running; then
+        msg "Unloading current model:\n$(cfg_get MODEL)\n\nStopping llama.cpp..."
+        if command -v rc-service >/dev/null 2>&1; then
+            rc-service llama-server stop || true
+        else
+            pkill -f /opt/llama.cpp/llama-server 2>/dev/null || true; sleep 2
+        fi
+    fi
+    cfg_set MODEL "$model"
+    cfg_set CONTEXT "$ctx"
+    ps5llm sampling apply "$model" >/dev/null 2>&1 || true
+    msg "Loading:\n$model\ncontext=$ctx\n\nStarting llama.cpp (GPU/VRAM offload)..."
+    if command -v rc-service >/dev/null 2>&1; then
+        out=$(rc-service llama-server start 2>&1) || { msg "FAILED to start:\n$out\n\nLog: /var/log/llama-server.log"; return 1; }
+    else
+        ps5llm llama start || { msg "FAILED to start. Log: /var/log/llama-server.log"; return 1; }
+    fi
+    sleep 2
+    if llama_running; then
+        msg "Model loaded and serving:\n$model\nctx=$ctx\nport=$(cfg_get PORT)"
+    else
+        msg "Start reported OK but no process found.\nCheck /var/log/llama-server.log"
+        return 1
+    fi
+}
+
+menu_models() {
+    current=$(cfg_get MODEL)
+    if [ -z "$(list_models)" ]; then msg "No .gguf files in $MODELS_DIR.\nCopy models there, then rescan."; return 0; fi
+    sel=$(list_models | while read -r m; do
+        mark=" "; [ "$m" = "$current" ] && mark="*"
+        printf '%s|[%s] %s  (ctx %s)\n' "$m" "$mark" "$(basename "$m")" "$(model_ctx_get "$m")"
+    done | pick_one "Select model (* = loaded). Next: Load it?") || return 0
+    ctx=$(model_ctx_get "$sel")
+    if yesno "Load this model?\n\n$sel\ncontext=$ctx\n\nThe running model (if any) is unloaded first."; then
+        do_load_model "$sel"
+    fi
+}
+
+
+menu_context() {
+    [ -n "$(list_models)" ] || { msg "No .gguf files in $MODELS_DIR."; return 0; }
+    sel=$(list_models | while read -r m; do
+        printf '%s|%s  (ctx %s)\n' "$m" "$(basename "$m")" "$(model_ctx_get "$m")"
+    done | pick_one "Which model gets a new context size?") || return 0
+    cur=$(model_ctx_get "$sel")
+    val=$(ctx_pick "$cur" "Context window for $(basename "$sel")
+
+Fixed ladder (PS5LM Plus style): 4k to 1M.
+Current: $cur
+
+All values are 256-aligned, so n_ctx = chosen value.") || return 0
+    model_ctx_set "$sel" "$val"
+    # if this is the loaded model, apply immediately (unload -> reload)
+    if [ "$sel" = "$(cfg_get MODEL)" ]; then
+        cfg_set CONTEXT "$val"
+        if llama_running && yesno "This model is loaded. Restart llama.cpp now to apply ctx=$val?"; then
+            if command -v rc-service >/dev/null 2>&1; then rc-service llama-server restart || true; else ps5llm llama restart || true; fi
+        fi
+    fi
+    msg "Saved: $(basename "$sel") -> ctx=$val (effective n_ctx=$val)"
+}
+
+menu_wifi() {
+    ifaces=$(wifi_ifaces)
+    [ -n "$ifaces" ] || { msg "No WiFi interface found (checked wlan*/mlan*/wlp*).\nOnboard WiFi needs its firmware; USB adapters need drivers.\nSee 'USB devices' in System, or 'ps5llm usb list' over SSH."; return 0; }
+    wlan=$(echo "$ifaces" | head -1)
+    ip link set dev "$wlan" up 2>/dev/null || true
+    msg "Scanning on $wlan (takes ~10s)..."
+    nets=$(iw dev "$wlan" scan 2>/dev/null | grep 'SSID:' | sed 's/.*SSID: //' | grep -v '^$' | sort -u)
+    [ -n "$nets" ] || { msg "No networks found on $wlan.\nCheck the adapter + 'ps5llm usb list' over SSH."; return 0; }
+    ssid=$(echo "$nets" | while read -r s; do printf '%s|%s\n' "$s" "$s"; done | pick_one "Select network") || return 0
+    psk=$(ask_secret "Passphrase for '$ssid'") || return 0
+    [ -n "$psk" ] || { msg "Empty passphrase - cancelled."; return 0; }
+    if ! yesno "Got ${#psk} characters. Connect $wlan to '$ssid'?"; then return 0; fi
+    msg "Connecting $wlan to '$ssid'..."
+    ps5llm wifi connect "$ssid" "$psk" || true
+    sleep 3
+
+    # Save for auto-connect on boot
+    if yesno "Connect to '$ssid' automatically on every boot?
+\nThis saves the network and enables WiFi at startup."; then
+        # Ensure wpa_supplicant service is enabled at boot
+        rc-update add wpa_supplicant default 2>/dev/null || true
+        # Also add wpa_cli if present (handles DHCP signaling)
+        [ -x /etc/init.d/wpa_cli ] && rc-update add wpa_cli default 2>/dev/null || true
+        msg "Network '$ssid' saved.\nWiFi will auto-connect on boot.\n\nService: wpa_supplicant (default runlevel)"
+    fi
+
+    msg "Result:\n$(ip addr show "$wlan" 2>/dev/null | grep 'inet ' || echo 'no IP yet - check key, retry, or see wpa log')"
+}
+menu_server() {
+    st="stopped"; llama_running && st="running (PID $(pidof llama-server 2>/dev/null || echo ?))"
+    sel=$(printf '%s\n' "start|Start llama.cpp" "stop|Stop llama.cpp (unload model)" \
+        "restart|Restart llama.cpp" "log|View server log" | pick_one "Server is: $st") || return 0
+    case "$sel" in
+        start)   if command -v rc-service >/dev/null 2>&1; then rc-service llama-server start || true; else ps5llm llama start || true; fi; msg "Start requested. Status: $(llama_running && echo RUNNING || echo NOT running - see log)";;
+        stop)    if command -v rc-service >/dev/null 2>&1; then rc-service llama-server stop || true; else ps5llm llama stop || true; fi; msg "Stopped (model unloaded, SSH unaffected).";;
+        restart) if command -v rc-service >/dev/null 2>&1; then rc-service llama-server restart || true; else ps5llm llama restart || true; fi; msg "Restart requested.";;
+        log)     log=$(tail -30 /var/log/llama-server.log 2>/dev/null || echo "no log yet"); msg "$log";;
+    esac
+}
+
+
+_dev_ip() {
+    ip addr show 2>/dev/null | grep 'inet ' | grep -v '127.0.0.1' | awk '{print $2}' | cut -d/ -f1 | head -1
+}
+
+menu_server_settings() {
+    # Every launch parameter the llama-server init script reads from
+    # /etc/llama/llama.conf (sampling/model/MTP/reasoning have their own
+    # menus). Changes are applied by ps5llm, which restarts the server.
+    while true; do
+        sel=$(printf '%s\n' \
+            "HOST|HOST = $(cfg_get HOST)  [$( _dev_ip)]   (listen address)" \
+            "PORT|PORT = $(cfg_get PORT)   (HTTP port; agent harness/worker use 8080)" \
+            "THREADS|THREADS = $(cfg_get THREADS)   (CPU threads 1-32)" \
+            "GPU_LAYERS|GPU_LAYERS = $(cfg_get GPU_LAYERS)   (999 = all)" \
+            "FIT|FIT = $(cfg_get FIT)   (auto-fit args on/off)" \
+            "BATCH|BATCH = $(cfg_get BATCH)   (logical batch)" \
+            "UBATCH|UBATCH = $(cfg_get UBATCH)   (physical batch)" \
+            "CTX_CHECKPOINTS|CTX_CHECKPOINTS = $(cfg_get CTX_CHECKPOINTS)   (0-16)" \
+            "CACHE_RAM|CACHE_RAM = $(cfg_get CACHE_RAM) MiB   (0 = off)" \
+            "CACHE_K|CACHE_K = $(cfg_get CACHE_K)   (K cache type)" \
+            "CACHE_V|CACHE_V = $(cfg_get CACHE_V)   (V cache type)" \
+            "FLASH_ATTN|FLASH_ATTN = $(cfg_get FLASH_ATTN)   (on/off/auto)" \
+            "MMPROJ|MMPROJ = $(cfg_get MMPROJ)   (vision path, empty = off)" \
+            "context|Context size per model" \
+            "mtp|MTP speculative decoding"  \
+            "thinking|Thinking / reasoning"  \
+            "sampling|Sampling parameters"  \
+            "back|Back" \
+            | pick_one "Server launch settings (global).
+Changes restart llama.cpp.") || return 0
+        [ "$sel" = "back" ] && return 0
+        [ "$sel" = "context" ] && { menu_context; continue; }
+        [ "$sel" = "mtp" ] && { menu_mtp; continue; }
+        [ "$sel" = "thinking" ] && { menu_thinking; continue; }
+        [ "$sel" = "sampling" ] && { menu_sampling; continue; }
+        cur=$(cfg_get "$sel")
+        if [ "$sel" = "PORT" ]; then
+            yesno "Changing PORT will disconnect agent harness/worker until their URLs are updated.\n\nContinue?" || continue
+        fi
+        if [ "$sel" = "CACHE_K" ] || [ "$sel" = "CACHE_V" ]; then
+            # Quantized KV types are an enum: pick from a knob, never type.
+            val=$(printf '%s\n' \
+                "f32|f32   (full precision, most VRAM)" \
+                "f16|f16   (half precision)" \
+                "bf16|bf16  (bfloat16)" \
+                "q8_0|q8_0  (8-bit, ~1/2 of f16)" \
+                "q4_0|q4_0  (4-bit, ~1/4 of f16)" \
+                "q4_1|q4_1  (4-bit with delta)" \
+                "q5_0|q5_0  (5-bit)" \
+                "q5_1|q5_1  (5-bit with delta)" \
+                "iq4_nl|iq4_nl (4-bit non-linear)" \
+                | pick_one "Cache type for $sel (currently $cur)") || continue
+        else
+            prompt="New value for $sel"
+            [ "$sel" = "MMPROJ" ] && prompt="$prompt (type - to clear)"
+            val=$(ask_text "$prompt" "$cur") || return 0
+            [ "$sel" = "MMPROJ" ] && [ "$val" = "-" ] && val=""
+        fi
+        out=$(ps5llm settings set "$sel" "$val" 2>&1) || { msg "Rejected:\n\n$out"; continue; }
+        msg "$out"
+    done
+}
+
+menu_vram() {
+    # VRAM knob: preset values 512MB .. 16.0GB in 0.1GB increments.
+    # Display: human-readable GB. Underlying: MB -> hex bytes in vram.txt.
+    # Formula: MB = round(display_GB * 1024); hex = MB * 1024 * 1024
+    cur=$(vram_get)
+    curmb=$(echo "$cur" | awk '{h=tolower($0);sub(/^0x/,"",h);n=0;
+        for(i=1;i<=length(h);i++)n=n*16+index("0123456789abcdef",substr(h,i,1))-1;
+        if(n<1)n=0; printf "%d", n/1048576}');
+    case "$curmb" in ''|*[!0-9]*) curmb=13824;; esac
+    [ "$curmb" -lt 512 ] && curmb=512
+    [ "$curmb" -gt 16384 ] && curmb=16384
+    curgb=$(awk -v m="$curmb" 'BEGIN{printf "%.1f", m/1024}')
+
+    # Generate preset list: "MB|label" lines (512MB + 1.1..16.0 in 0.1 steps)
+    _presets=$(awk 'BEGIN{
+        printf "512|512 MB\n"
+        for(i=11; i<=160; i++) {
+            gb = i/10
+            mb = int(gb * 1024 + 0.5)
+            printf "%d|%.1f GB\n", mb, gb
+        }
+    }')
+
+    # Build menu items, marking the current value
+    _items=""
+    while IFS='|' read -r _mb _label; do
+        [ -n "$_mb" ] || continue
+        if [ "$_mb" = "$curmb" ]; then
+            _items="${_items}${_mb}|${_label}  (now)\n"
+        else
+            _items="${_items}${_mb}|${_label}\n"
+        fi
+    done <<PRESETS
+$_presets
+PRESETS
+
+    _sel=$(printf '%b' "$_items" | pick_one "VRAM allocation (applies after reboot)
+Current: ${curgb} GB (${curmb} MB, ${cur})
+Range: 512 MB - 16.0 GB in 0.1 GB steps") || return 0
+
+    case "$_sel" in ''|*[!0-9]*) return 0;; esac
+    [ "$_sel" -lt 512 ] && return 0
+    [ "$_sel" -gt 16384 ] && return 0
+
+    newhex=$(printf '0x%X' $(( _sel * 1024 * 1024 )))
+    newgb=$(awk -v m="$_sel" 'BEGIN{printf "%.1f", m/1024}')
+
+    if yesno "Set VRAM to ${newgb} GB (${_sel} MB)?
+Hex: ${newhex}
+Takes effect after REBOOT."; then
+        vram_set "$newhex"
+        msg "VRAM set to ${newgb} GB (${_sel} MB, ${newhex}).
+Reboot from the Main menu to apply."
+    fi
+}
+menu_fan() {
+    # PS5 fan via ps5_control (/dev/icc). No readable state: acts + reports.
+    sel=$(printf '%s\n' \
+        "on|Fan ON (driver auto curve)" \
+        "max|Fan MAX (loudest)" \
+        "off|Fan OFF (firmware default)" \
+        | pick_one "PS5 fan control") || return 0
+    out=$(/usr/local/sbin/ps5_control --fan "$sel" 2>&1)
+    msg "Fan -> $sel\n$out"
+}
+
+menu_boost() {
+    # PS5 overclock (boost) via ps5_control (/dev/mp1). No readable state.
+    sel=$(printf '%s\n' \
+        "on|Overclock ON (boost)" \
+        "off|Overclock OFF" \
+        | pick_one "PS5 overclock (boost)") || return 0
+    out=$(/usr/local/sbin/ps5_control --boost "$sel" 2>&1)
+    msg "Overclock -> $sel\n$out"
+}
+
+mtp_knob_get() {
+    # MTP draft tokens per step (--spec-draft-n-max knob): 1..4.
+    # Unset/anything else means the server default (3). Written as
+    # SPEC_DRAFT_N_MAX in llama.conf by menu_mtp / `ps5llm mtp knob N`.
+    k=$(cfg_get SPEC_DRAFT_N_MAX)
+    case "$k" in 1|2|3|4) printf '%s' "$k";; *) printf '3';; esac
+}
+
+menu_mtp() {
+    # MTP speculative decoding switch + draft-depth knob (1..4 draft tokens
+    # per step -> --spec-draft-n-max). MTP needs a model that ships MTP
+    # layers (*-mtp.gguf); turning it ON for a plain GGUF makes llama.cpp
+    # abort at load. Flips SPEC_TYPE / SPEC_DRAFT_N_MAX in llama.conf, then
+    # unload/reloads llama.cpp.
+    cur=$(cfg_get SPEC_TYPE)
+    if [ "$cur" = "draft-mtp" ]; then st="ON"; else st="OFF"; fi
+    kn=$(mtp_knob_get)
+    mdl=$(basename "$(cfg_get MODEL)" 2>/dev/null || echo none)
+    m1=""; m2=""; m3=""; m4=""
+    case "$kn" in
+        1) m1="  (now)";;
+        2) m2="  (now)";;
+        3) m3="  (now)";;
+        4) m4="  (now)";;
+    esac
+    sel=$(printf '%s\n' \
+        "toggle|Toggle MTP  (now: $st)" \
+        "on|Turn MTP ON  (needs an *-mtp.gguf model)" \
+        "off|Turn MTP OFF (plain GGUF models)" \
+        "knob1|Knob: draft tokens per step = 1$m1" \
+        "knob2|Knob: draft tokens per step = 2$m2" \
+        "knob3|Knob: draft tokens per step = 3 (server default)$m3" \
+        "knob4|Knob: draft tokens per step = 4$m4" \
+        | pick_one "MTP speculative decoding: $st   knob: $kn/step\nModel: $mdl") || return 0
+    case "$sel" in
+        toggle) if [ "$st" = "ON" ]; then sel="off"; else sel="on"; fi;;
+    esac
+    case "$sel" in
+        knob1|knob2|knob3|knob4)
+            cfg_set SPEC_DRAFT_N_MAX "${sel#knob}"
+            nkn=$(mtp_knob_get)
+            note=""
+            [ "$st" = "OFF" ] && note="\n\n(MTP is OFF right now; the knob applies once MTP is ON.)"
+            if llama_running && yesno "MTP knob saved: $nkn draft tokens per step.\n\nRestart llama.cpp now to apply?"; then
+                if command -v rc-service >/dev/null 2>&1; then rc-service llama-server restart || true; else ps5llm llama restart || true; fi
+                sleep 2
+                msg "MTP knob is now $nkn/step.$note\nServer: $(llama_running && echo RUNNING || echo NOT running)"
+            else
+                msg "MTP knob saved: $nkn/step.$note\nRestart llama.cpp from the Server menu to apply."
+            fi
+            return 0
+            ;;
+    esac
+    if [ "$sel" = "on" ]; then
+        case "$mdl" in
+            *-mtp.gguf) ;;
+            *) yesno "Model '$mdl' does not look like an MTP build.\nTurning MTP ON will make llama.cpp FAIL to load.\n\nEnable anyway?" || return 0;;
+        esac
+        cfg_set SPEC_TYPE draft-mtp
+    else
+        cfg_set SPEC_TYPE ""
+    fi
+    newst="OFF"; [ "$(cfg_get SPEC_TYPE)" = "draft-mtp" ] && newst="ON"
+    if llama_running && yesno "MTP saved as $newst.\n\nRestart llama.cpp now to apply?"; then
+        if command -v rc-service >/dev/null 2>&1; then rc-service llama-server restart || true; else ps5llm llama restart || true; fi
+        sleep 2
+        msg "MTP is now $newst.\nServer: $(llama_running && echo RUNNING || echo NOT running)"
+    else
+        msg "MTP saved as $newst.\nRestart llama.cpp from the Server menu to apply."
+    fi
+}
+
+menu_thinking() {
+    # Thinking / reasoning switch. REASONING_MODE/REASONING_EFFORT drive
+    # --reasoning / --reasoning-effort; REASONING_BUDGET (tokens) and
+    # REASONING_PRESERVE (on/off) are the two remaining launch knobs.
+    mode=$(cfg_get REASONING_MODE)
+    eff=$(cfg_get REASONING_EFFORT)
+    budget=$(cfg_get REASONING_BUDGET)
+    preserve=$(cfg_get REASONING_PRESERVE)
+    [ -n "$budget" ] || budget="(no flag)"
+    [ -n "$preserve" ] || preserve="(no flag)"
+    if [ "$mode" = "off" ]; then st="OFF"
+    elif [ -n "$eff" ]; then st="$eff"
+    elif [ "$mode" = "on" ]; then st="ON"
+    else st="auto (template)"; fi
+    mdl=$(basename "$(cfg_get MODEL)" 2>/dev/null || echo none)
+    sel=$(printf '%s\n' \
+        "off|Thinking OFF  (no reasoning)" \
+        "auto|Auto  (model template decides - default)" \
+        "on|Thinking ON  (force)" \
+        "minimal|Effort: minimal" \
+        "low|Effort: low" \
+        "medium|Effort: medium" \
+        "high|Effort: high" \
+        "xhigh|Effort: xhigh" \
+        "max|Effort: max" \
+        "default|Effort: default (template default)" \
+        "budget|Budget: $budget tokens  (-1 = no limit)" \
+        "preserve|Preserve reasoning: $preserve" \
+        | pick_one "Thinking / reasoning: $st
+Model: $mdl
+Budget: $budget   Preserve: $preserve
+
+Note: effort levels only affect models whose
+template reads them (e.g. Swift). Ornith is on/off.") || return 0
+    case "$sel" in
+        off)     cfg_set REASONING_MODE off;  cfg_set REASONING_EFFORT "" ;;
+        auto)    cfg_set REASONING_MODE auto; cfg_set REASONING_EFFORT "" ;;
+        on)      cfg_set REASONING_MODE on;   cfg_set REASONING_EFFORT "" ;;
+        default) cfg_set REASONING_MODE on;   cfg_set REASONING_EFFORT default ;;
+        budget)
+            val=$(ask_text "Reasoning budget tokens (-1 = no limit, 0 = none)" "$budget") || return 0
+            out=$(ps5llm reasoning budget "$val" 2>&1) || { msg "Rejected:\n\n$out"; return 1; }
+            msg "$out"; return 0 ;;
+        preserve)
+            psel=$(printf '%s\n' "on|Preserve ON" "off|Preserve OFF" "auto|No flag (server default)" \
+                | pick_one "Preserve reasoning context across turns") || return 0
+            out=$(ps5llm reasoning preserve "$psel" 2>&1) || { msg "Rejected:\n\n$out"; return 1; }
+            msg "$out"; return 0 ;;
+        *)       cfg_set REASONING_MODE on;   cfg_set REASONING_EFFORT "$sel" ;;
+    esac
+    nmode=$(cfg_get REASONING_MODE); neff=$(cfg_get REASONING_EFFORT)
+    if [ "$nmode" = "off" ]; then newst="OFF"
+    elif [ -n "$neff" ]; then newst="$neff"
+    elif [ "$nmode" = "on" ]; then newst="ON"
+    else newst="auto (template)"; fi
+    if llama_running && yesno "Thinking saved as: $newst\n\nRestart llama.cpp now to apply?"; then
+        if command -v rc-service >/dev/null 2>&1; then rc-service llama-server restart || true; else ps5llm llama restart || true; fi
+        sleep 2
+        msg "Thinking is now: $newst\nServer: $(llama_running && echo RUNNING || echo NOT running)"
+    else
+        msg "Thinking saved as: $newst\nRestart llama.cpp from the Server menu to apply."
+    fi
+}
+
+menu_sampling() {
+    # Per-model sampling: TEMP, TOP_K, TOP_P, MIN_P, REPEAT_PENALTY,
+    # PRESENCE_PENALTY. ps5llm owns storage/defaults; a change to the loaded
+    # model updates llama.conf and restarts llama.cpp, like MTP/thinking.
+    mdl=$(cfg_get MODEL)
+    [ -n "$mdl" ] || { msg "No model configured."; return 0; }
+    sstat=$(ps5llm sampling status "$mdl" 2>/dev/null || true)
+    temp=$(echo "$sstat" | awk '/^  TEMP:/{print $2; exit}')
+    top_k=$(echo "$sstat" | awk '/^  TOP_K:/{print $2; exit}')
+    top_p=$(echo "$sstat" | awk '/^  TOP_P:/{print $2; exit}')
+    min_p=$(echo "$sstat" | awk '/^  MIN_P:/{print $2; exit}')
+    repeat=$(echo "$sstat" | awk '/^  REPEAT_PENALTY:/{print $2; exit}')
+    presence=$(echo "$sstat" | awk '/^  PRESENCE_PENALTY:/{print $2; exit}')
+    src=$(echo "$sstat" | awk '/^  Source:/{print $2, $3; exit}')
+    [ -n "$temp" ] || temp="?"
+    [ -n "$top_k" ] || top_k="?"
+    [ -n "$top_p" ] || top_p="?"
+    [ -n "$min_p" ] || min_p="?"
+    [ -n "$repeat" ] || repeat="?"
+    [ -n "$presence" ] || presence="?"
+    [ -n "$src" ] || src="unknown"
+    sel=$(printf '%s\n' \
+        "temp|TEMP = $temp   (0.0-2.0, randomness)" \
+        "top_k|TOP_K = $top_k   (1-100, candidate pool)" \
+        "top_p|TOP_P = $top_p   (0.0-1.0, nucleus)" \
+        "min_p|MIN_P = $min_p   (0.0-1.0, min probability)" \
+        "repeat_penalty|REPEAT_PENALTY = $repeat   (0.0-4.0, 1.0 = off)" \
+        "presence_penalty|PRESENCE_PENALTY = $presence   (-2.0-2.0)" \
+        "reset|Reset to this model's preset defaults" \
+        "defaults|Show preset defaults" \
+        | pick_one "Sampling parameters for $(basename "$mdl"):
+  TEMP=$temp  TOP_K=$top_k  TOP_P=$top_p
+  MIN_P=$min_p
+  REPEAT_PENALTY=$repeat  PRESENCE_PENALTY=$presence
+  Source: $src
+
+Changing the loaded model's values restarts llama.cpp.") || return 0
+    case "$sel" in
+        temp)
+            val=$(ask_text "TEMP (0.0-2.0)" "$temp") || return 0
+            out=$(ps5llm sampling temp "$val" "$mdl" 2>&1) || { msg "Rejected:\n\n$out"; return 1; }
+            msg "$out" ;;
+        top_k)
+            val=$(ask_text "TOP_K (1-100)" "$top_k") || return 0
+            out=$(ps5llm sampling top_k "$val" "$mdl" 2>&1) || { msg "Rejected:\n\n$out"; return 1; }
+            msg "$out" ;;
+        top_p)
+            val=$(ask_text "TOP_P (0.0-1.0)" "$top_p") || return 0
+            out=$(ps5llm sampling top_p "$val" "$mdl" 2>&1) || { msg "Rejected:\n\n$out"; return 1; }
+            msg "$out" ;;
+        min_p)
+            val=$(ask_text "MIN_P (0.0-1.0)" "$min_p") || return 0
+            out=$(ps5llm sampling min_p "$val" "$mdl" 2>&1) || { msg "Rejected:\n\n$out"; return 1; }
+            msg "$out" ;;
+        repeat_penalty)
+            val=$(ask_text "REPEAT_PENALTY (0.0-4.0, 1.0 = off)" "$repeat") || return 0
+            out=$(ps5llm sampling repeat_penalty "$val" "$mdl" 2>&1) || { msg "Rejected:\n\n$out"; return 1; }
+            msg "$out" ;;
+        presence_penalty)
+            val=$(ask_text "PRESENCE_PENALTY (-2.0-2.0)" "$presence") || return 0
+            out=$(ps5llm sampling presence_penalty "$val" "$mdl" 2>&1) || { msg "Rejected:\n\n$out"; return 1; }
+            msg "$out" ;;
+        reset)
+            if yesno "Reset $(basename "$mdl") to its preset defaults?\n\nllama.cpp restarts if this model is loaded."; then
+                out=$(ps5llm sampling reset "$mdl" 2>&1) || true
+                msg "$out"
+            fi ;;
+        defaults)
+            out=$(ps5llm sampling defaults "$mdl" 2>&1) || true
+            msg "$out" ;;
+    esac
+}
+
+menu_cu() {
+    # GPU compute units: status + unlock arming. The unlock itself needs the
+    # ported amdgpu module (see /root/PS5-CU-PORT-PLAN.txt); this toggle arms
+    # the modprobe config so it applies at driver load, and reports state.
+    cur=$(dmesg 2>/dev/null | grep -a -o -E "active_cu_number [0-9]+" | tail -n 1)
+    mod=$(lsmod 2>/dev/null | grep -c amdgpu || true)
+    cfg="/etc/modprobe.d/ps5-cu-unlock.conf"
+    armed="no"; [ -f "$cfg" ] && armed="yes"
+    sel=$(printf '%s\n' \
+        "status|Show CU status" \
+        "on|Unlock 40 CUs (arm at boot)" \
+        "off|Back to stock 36 CUs" \
+        | pick_one "GPU CUs: ${cur:-unknown}, module: $([ "$mod" -gt 0 ] && echo loaded || echo n/a), unlock armed: $armed") || return 0
+    case "$sel" in
+        status) msg "dmesg: ${cur:-unknown}\nmodprobe config: $([ -f "$cfg" ] && cat "$cfg" || echo none)\nNOTE: unlock needs the ported module (plan in /root/)." ;;
+        on) printf "%s\n" "# PS5 CU unlock (armed from TUI; installer uncomments once" "# the ported module exists -- active unknown params break driver load)" "#options amdgpu ps5_cc_write_mode=3" > "$cfg"; msg "CU unlock ARMED (staged safe).\nInstaller activates it with the ported module.\nSee /root/PS5-CU-PORT-PLAN.txt." ;;
+        off) rm -f "$cfg"; msg "CU unlock OFF (stock 36 CUs). Config removed." ;;
+    esac
+}
+
+menu_status() {
+    msg "$(ps5llm status 2>/dev/null || echo 'ps5llm unavailable')"
+}
+
+menu_usb() {
+    out="USB devices:\n$({ lsusb 2>/dev/null || ls /sys/bus/usb/devices/ 2>/dev/null; })\n\nNet interfaces:\n$(ls /sys/class/net/ 2>/dev/null)\n\nDRI (GPU):\n$(ls /dev/dri/ 2>/dev/null || echo MISSING)"
+    msg "$out"
+}
+
+# --- Hugging Face Models integration ---
+[ -f /usr/local/lib/menu_hf.sh ] && . /usr/local/lib/menu_hf.sh
+menu_system_settings() {
+    while true; do
+        sel=$(printf '%s\n' \
+            "usb|USB devices" \
+            "fan|PS5 fan" \
+            "boost|Overclock / boost" \
+            "vram|VRAM allocation" \
+            "wifi|WiFi" \
+            "cu|GPU compute units" \
+            "back|Back" \
+            | pick_one "System settings (hardware).") || return 0
+        [ "$sel" = "back" ] && return 0
+        case "$sel" in
+            usb)    menu_usb || true;;
+            fan)    menu_fan || true;;
+            boost)  menu_boost || true;;
+            vram)   menu_vram || true;;
+            wifi)   menu_wifi || true;;
+            cu)     menu_cu || true;;
+        esac
+    done
+}
+
+menu_main() {
+    while true; do
+        st="STOPPED"; llama_running && st="RUNNING"
+        cur=$(basename "$(cfg_get MODEL)" 2>/dev/null || echo none)
+        mtpst="OFF"; [ "$(cfg_get SPEC_TYPE)" = "draft-mtp" ] && mtpst="ON"
+        mtpdesc="$mtpst"; [ "$mtpst" = "ON" ] && mtpdesc="$mtpst, $(mtp_knob_get)/step"
+        tmode=$(cfg_get REASONING_MODE); teff=$(cfg_get REASONING_EFFORT)
+        if [ "$tmode" = "off" ]; then thst="OFF"
+        elif [ -n "$teff" ]; then thst="$teff"
+        elif [ "$tmode" = "on" ]; then thst="ON"
+        else thst="auto"; fi
+        # Stats snapshot in the header: fresh on every draw (i.e. after
+        # every action), no background refresh loops, nothing to get stuck
+        # in. Cancel/ESC simply redraws.
+        prompt="$(stats_block)"
+        sel=$(printf '%s\n' \
+            "models|Models  (loaded: $cur)" \
+            "hfmodels|Hugging Face  (browse/download)" \
+            "server|Server: $st  (start/stop/restart/log)" \
+            "settings|Server settings  (port $(cfg_get PORT), $(cfg_get THREADS) threads)" \
+            "system|System settings  (USB, fan, VRAM, WiFi, GPU)" \
+            "status|System status" \
+            "shell|Exit to shell" \
+            "reboot|Reboot PS5" \
+            "off|Shutdown PS5" \
+            | pick_one "$prompt") || { sleep 1; continue; }
+        case "$sel" in
+            # NOTE the `|| true` on every branch: under `set -eu` a failed
+            # action (bad input, failed start, declined confirm) would
+            # otherwise kill the whole panel instead of returning to it.
+            models)  menu_models || true;;
+            hfmodels) menu_hf || true;;
+            server)  menu_server || true;;
+            settings) menu_server_settings || true;;
+            system) menu_system_settings || true;;
+            status)  menu_status || true;;
+            shell)   echo "Type 'exit' to return to the panel." > /dev/tty; exec /bin/sh;;
+            reboot)  yesno "Reboot the PS5 now?" && reboot || true;;
+            off)     yesno "Shut down the PS5 now?" && poweroff || true;;
+        esac
+    done
+}
+
+ensure_conf
+menu_main

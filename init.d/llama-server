@@ -1,0 +1,147 @@
+#!/sbin/openrc-run
+# llama.cpp server for PS5 Alpine LLM - GPU-first (Vulkan/RADV into VRAM)
+
+LLAMA_BIN="/opt/llama.cpp/llama-server"
+
+depend() {
+    need net
+    after sshd
+}
+
+start() {
+    ebegin "Starting llama.cpp server (GPU/Vulkan)..."
+
+    export RADV_DEBUG=nohiz
+    export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json
+    export LD_LIBRARY_PATH=/opt/llama.cpp/lib
+
+    if [ ! -e /dev/dri/renderD128 ]; then
+        eend 1 "No GPU render node (/dev/dri/renderD128). amdgpu/RADV not ready - refusing CPU fallback for large models"
+        return 1
+    fi
+
+    mkdir -p /etc/llama
+    if [ ! -f /etc/llama/llama.conf ]; then
+        # Fresh conf gets the PS5LM-Plus launch recipe by default so every
+        # current and future model runs with the same memory-safe flags.
+        printf %s\n \
+            "MODEL=/models/iq3-27b.gguf" \
+            "HOST=0.0.0.0" \
+            "PORT=8080" \
+            "CONTEXT=8192" \
+            "THREADS=8" \
+            "GPU_LAYERS=999" \
+            "FIT=off" \
+            "BATCH=256" \
+            "UBATCH=64" \
+            "CTX_CHECKPOINTS=1" \
+            "CACHE_RAM=0" \
+            "CACHE_K=q4_0" \
+            "CACHE_V=q4_0" \
+            "FLASH_ATTN=on" \
+            "TEMP=0.6" \
+            "TOP_K=20" \
+            "TOP_P=0.95" \
+            "MIN_P=0.0" \
+            "REASONING_MODE=auto" > /etc/llama/llama.conf
+    fi
+
+    MODEL=$(grep ^MODEL= /etc/llama/llama.conf 2>/dev/null | cut -d= -f2-)
+    MMPROJ=$(grep ^MMPROJ= /etc/llama/llama.conf 2>/dev/null | cut -d= -f2-)
+    SPEC_TYPE=$(grep ^SPEC_TYPE= /etc/llama/llama.conf 2>/dev/null | cut -d= -f2-)
+    SPEC_DRAFT_N_MAX=$(grep ^SPEC_DRAFT_N_MAX= /etc/llama/llama.conf 2>/dev/null | cut -d= -f2-)
+    HOST=$(grep ^HOST= /etc/llama/llama.conf 2>/dev/null | cut -d= -f2-)
+    PORT=$(grep ^PORT= /etc/llama/llama.conf 2>/dev/null | cut -d= -f2-)
+    THREADS=$(grep ^THREADS= /etc/llama/llama.conf 2>/dev/null | cut -d= -f2-)
+    GPU_LAYERS=$(grep ^GPU_LAYERS= /etc/llama/llama.conf 2>/dev/null | cut -d= -f2-)
+    CACHE_K=$(grep ^CACHE_K= /etc/llama/llama.conf 2>/dev/null | cut -d= -f2-)
+    CACHE_V=$(grep ^CACHE_V= /etc/llama/llama.conf 2>/dev/null | cut -d= -f2-)
+    FLASH_ATTN=$(grep ^FLASH_ATTN= /etc/llama/llama.conf 2>/dev/null | cut -d= -f2-)
+    REASONING_EFFORT=$(grep ^REASONING_EFFORT= /etc/llama/llama.conf 2>/dev/null | cut -d= -f2-)
+    REASONING_BUDGET=$(grep ^REASONING_BUDGET= /etc/llama/llama.conf 2>/dev/null | cut -d= -f2-)
+    REASONING_MODE=$(grep ^REASONING_MODE= /etc/llama/llama.conf 2>/dev/null | cut -d= -f2-)
+    REASONING_PRESERVE=$(grep ^REASONING_PRESERVE= /etc/llama/llama.conf 2>/dev/null | cut -d= -f2-)
+    TEMP=$(grep ^TEMP= /etc/llama/llama.conf 2>/dev/null | cut -d= -f2-)
+    TOP_K=$(grep ^TOP_K= /etc/llama/llama.conf 2>/dev/null | cut -d= -f2-)
+    TOP_P=$(grep ^TOP_P= /etc/llama/llama.conf 2>/dev/null | cut -d= -f2-)
+    MIN_P=$(grep ^MIN_P= /etc/llama/llama.conf 2>/dev/null | cut -d= -f2-)
+    PRESENCE_PENALTY=$(grep ^PRESENCE_PENALTY= /etc/llama/llama.conf 2>/dev/null | cut -d= -f2-)
+    REPEAT_PENALTY=$(grep ^REPEAT_PENALTY= /etc/llama/llama.conf 2>/dev/null | cut -d= -f2-)
+    # PS5LM-Plus-derived memory/context flags (see model_plan.cpp there):
+    #   FIT=off  - never auto-adjust args to fit (the planner/config sets them)
+    #   BATCH/UBATCH 256/64 - small batches keep prefill spikes inside the pool
+    #   CTX_CHECKPOINTS=1 - one context checkpoint; 0 disabled prompt restore
+    #   CACHE_RAM=0 - server default is an 8192 MiB host-RAM cache; this box
+    #                 has ~2 GiB, so the cache must stay off
+    FIT=$(grep ^FIT= /etc/llama/llama.conf 2>/dev/null | cut -d= -f2-)
+    BATCH=$(grep ^BATCH= /etc/llama/llama.conf 2>/dev/null | cut -d= -f2-)
+    UBATCH=$(grep ^UBATCH= /etc/llama/llama.conf 2>/dev/null | cut -d= -f2-)
+    CTX_CHECKPOINTS=$(grep ^CTX_CHECKPOINTS= /etc/llama/llama.conf 2>/dev/null | cut -d= -f2-)
+    CACHE_RAM=$(grep ^CACHE_RAM= /etc/llama/llama.conf 2>/dev/null | cut -d= -f2-)
+    SAVED_CTX=$(grep -F "$MODEL|" /etc/llama/models.conf 2>/dev/null | cut -d"|" -f2 | tail -1)
+    CONTEXT=${SAVED_CTX:-$(grep ^CONTEXT= /etc/llama/llama.conf 2>/dev/null | cut -d= -f2-)}
+    : "${HOST:=0.0.0.0}" "${PORT:=8080}" "${CONTEXT:=8192}" "${THREADS:=12}" "${GPU_LAYERS:=999}" "${CACHE_K:=q8_0}" "${CACHE_V:=q8_0}" "${FLASH_ATTN:=on}" "${TEMP:=1.0}" "${TOP_K:=20}" "${TOP_P:=0.95}" "${MIN_P:=0.0}" "${PRESENCE_PENALTY:=0.0}" "${REPEAT_PENALTY:=1.0}" "${FIT:=off}" "${BATCH:=256}" "${UBATCH:=64}" "${CTX_CHECKPOINTS:=1}" "${CACHE_RAM:=0}"
+
+    if [ -z "$MODEL" ]; then
+        eend 1 "No model configured (MODEL empty in /etc/llama/llama.conf - run ps5llm model set)"
+        return 1
+    fi
+    if [ ! -f "$MODEL" ]; then
+        eend 1 "Model not found: $MODEL"
+        return 1
+    fi
+    if [ ! -x "$LLAMA_BIN" ]; then
+        eend 1 "llama.cpp binary missing: $LLAMA_BIN (rebuild with -DGGML_VULKAN=ON)"
+        return 1
+    fi
+
+    pkill -f "$LLAMA_BIN" 2>/dev/null || true
+    sleep 1
+
+    einfo "Model: $MODEL"
+    einfo "Host: $HOST Port: $PORT Ctx: $CONTEXT Threads: $THREADS GPU layers: $GPU_LAYERS Cache: $CACHE_K/$CACHE_V"
+    [ -n "$MMPROJ" ] && [ -f "$MMPROJ" ] && einfo "Vision projector: $MMPROJ"
+    [ -n "$SPEC_TYPE" ] && einfo "Speculative: $SPEC_TYPE (draft tokens/step knob: ${SPEC_DRAFT_N_MAX:-3})"
+    einfo "Flash attention: $FLASH_ATTN"
+    einfo "Fit: $FIT bat/ubat: $BATCH/$UBATCH ctx-checkpoints: $CTX_CHECKPOINTS cache-ram(MiB): $CACHE_RAM"
+    einfo "Reasoning: mode=$REASONING_MODE effort=$REASONING_EFFORT budget=$REASONING_BUDGET preserve=$REASONING_PRESERVE"
+    einfo "Sampling: temp=$TEMP top_k=$TOP_K top_p=$TOP_P min_p=$MIN_P presence=$PRESENCE_PENALTY repeat=$REPEAT_PENALTY"
+
+    set -- --model "$MODEL" --host "$HOST" --port "$PORT" \
+        --ctx-size "$CONTEXT" --threads "$THREADS" \
+        --n-gpu-layers "$GPU_LAYERS" --fit "$FIT" \
+        --cache-type-k "$CACHE_K" --cache-type-v "$CACHE_V" \
+        --parallel 1 --no-kv-unified \
+        --kv-offload --flash-attn "$FLASH_ATTN" \
+        --batch-size "$BATCH" --ubatch-size "$UBATCH" \
+        --ctx-checkpoints "$CTX_CHECKPOINTS" --cache-ram "$CACHE_RAM" \
+        --temp "$TEMP" --top-k "$TOP_K" --top-p "$TOP_P" --min-p "$MIN_P" \
+        --presence-penalty "$PRESENCE_PENALTY" --repeat-penalty "$REPEAT_PENALTY" \
+        --log-file /var/log/llama-server.log
+    [ -n "$MMPROJ" ] && [ -f "$MMPROJ" ] && set -- "$@" --mmproj "$MMPROJ"
+    [ -n "$SPEC_TYPE" ] && set -- "$@" --spec-type "$SPEC_TYPE" --spec-draft-type-k q4_0 --spec-draft-type-v q4_0
+    if [ -n "$SPEC_TYPE" ]; then
+        # MTP knob (TUI / `ps5llm mtp knob N`): draft tokens per step, 1..4.
+        case "$SPEC_DRAFT_N_MAX" in 1|2|3|4) set -- "$@" --spec-draft-n-max "$SPEC_DRAFT_N_MAX" ;; esac
+    fi
+    [ -n "$REASONING_MODE" ] && set -- "$@" --reasoning "$REASONING_MODE"
+    [ -n "$REASONING_EFFORT" ] && set -- "$@" --reasoning-effort "$REASONING_EFFORT"
+    [ -n "$REASONING_BUDGET" ] && set -- "$@" --reasoning-budget "$REASONING_BUDGET"
+    case "$REASONING_PRESERVE" in
+        on|1|true|yes)  set -- "$@" --reasoning-preserve ;;
+        off|0|false|no) set -- "$@" --no-reasoning-preserve ;;
+    esac
+
+    start-stop-daemon --start --background --make-pidfile \
+        --pidfile /run/llama.pid \
+        --exec "$LLAMA_BIN" -- "$@"
+    eend $?
+}
+
+stop() {
+    ebegin "Stopping llama.cpp server..."
+    start-stop-daemon --stop --pidfile /run/llama.pid 2>/dev/null || \
+        pkill -f "$LLAMA_BIN" 2>/dev/null || true
+    rm -f /run/llama.pid
+    eend 0
+}

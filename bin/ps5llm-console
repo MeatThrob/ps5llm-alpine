@@ -1,0 +1,14 @@
+#!/bin/sh
+# ps5llm-console - local console entry point, started by init on tty1 (HDMI).
+# Shows the control panel instead of a login prompt. SSH is unaffected.
+# init respawns this, so exiting the shell below returns to the panel.
+export TERM=linux
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Fallback to a shell if the panel is ever missing/not executable - without
+# this, init would respawn-fail in a tight loop and wedge the console.
+if [ -x /usr/bin/ps5llm-tui ]; then
+    exec /usr/bin/ps5llm-tui
+else
+    echo "ps5llm-tui missing - dropping to emergency shell" > /dev/tty
+    exec /bin/sh
+fi

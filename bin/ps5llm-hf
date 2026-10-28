@@ -1,0 +1,639 @@
+#!/bin/sh
+# ps5llm-hf - Hugging Face model management for PS5 LLM Appliance
+#
+# Shell wrapper around the `hf` CLI (huggingface_hub) for:
+#   - Searching/browsing the HF model catalog
+#   - Listing files in a model repo (with sizes)
+#   - Starting background downloads
+#   - Checking download progress
+#   - Managing local model inventory
+#
+# State lives in /var/lib/ps5llm-hf/
+#   jobs/       - one file per download job
+#   inventory.tsv - local model inventory
+#   hf_token    - HF auth token (chmod 600)
+#
+# Designed for minimal RAM: all API calls are short-lived `hf` CLI
+# invocations. Downloads run as background `hf download` processes.
+
+set -eu
+
+HF_STATE=/var/lib/ps5llm-hf
+HF_JOBS=$HF_STATE/jobs
+HF_INVENTORY=$HF_STATE/inventory.tsv
+HF_TOKEN_FILE=$HF_STATE/hf_token
+HF_CACHE=$HF_STATE/cache
+MODELS_DIR=/models
+MAX_WORKERS=2  # conservative for low-RAM device
+
+mkdir -p "$HF_JOBS" "$HF_CACHE"
+[ -f "$HF_INVENTORY" ] || printf 'repo_id\trevision\tpath\tsize\tstatus\tquant\tformat\n' > "$HF_INVENTORY"
+
+# ---------- helpers ----------
+
+hf_token() {
+    # Return the token if set, empty otherwise.
+    # Priority: $HF_TOKEN env > token file > hf CLI stored token
+    if [ -n "${HF_TOKEN:-}" ]; then printf '%s' "$HF_TOKEN"; return 0; fi
+    [ -f "$HF_TOKEN_FILE" ] && { cat "$HF_TOKEN_FILE"; return 0; }
+    # Check if hf CLI has a stored token
+    hf auth status --format json 2>/dev/null | grep -o '"authenticated":true' >/dev/null 2>&1 && return 0
+    return 1
+}
+
+hf_auth_args() {
+    # Echo --token <val> if a token is available
+    _t=$(hf_token 2>/dev/null) || true
+    [ -n "${_t:-}" ] && printf -- '--token %s' "$_t" || true
+}
+
+human_size() { # $1=bytes -> human readable
+    _b="$1"
+    case "$_b" in
+        ''|*[!0-9]*) echo "unknown";;
+        *) awk -v b="$_b" 'BEGIN{
+            if(b>=1073741824) printf "%.1f GB", b/1073741824
+            else if(b>=1048576) printf "%.0f MB", b/1048576
+            else if(b>=1024) printf "%.0f KB", b/1024
+            else printf "%d B", b
+        }';;
+    esac
+}
+
+disk_free_bytes() {
+    df -B1 "$MODELS_DIR" 2>/dev/null | tail -1 | awk '{print $4}'
+}
+
+# Quantization detection from filename
+detect_quant() { # $1=filename -> quant label
+    _f="$(basename "$1")"
+    _f=$(echo "$_f" | tr 'A-Z' 'a-z')
+    case "$_f" in
+        *q8_0*|*q8_0-*)          echo "Q8_0" ;;
+        *q6_k*|*q6_k-*)          echo "Q6_K" ;;
+        *q5_k_m*|*q5_k_m-*)      echo "Q5_K_M" ;;
+        *q5_k_s*|*q5_k_s-*)      echo "Q5_K_S" ;;
+        *q4_k_m*|*q4_k_m-*)      echo "Q4_K_M" ;;
+        *q4_k_s*|*q4_k_s-*)      echo "Q4_K_S" ;;
+        *q4_0*|*q4_0-*)          echo "Q4_0" ;;
+        *q4_1*|*q4_1-*)          echo "Q4_1" ;;
+        *q3_k_m*|*q3_k_m-*)      echo "Q3_K_M" ;;
+        *q3_k_s*|*q3_k_s-*)      echo "Q3_K_S" ;;
+        *q3_k_l*|*q3_k_l-*)      echo "Q3_K_L" ;;
+        *q2_k*|*q2_k-*)          echo "Q2_K" ;;
+        *iq8_xxs*|*iq8_xxs-*)    echo "IQ8_XXS" ;;
+        *iq8_xs*|*iq8_xs-*)      echo "IQ8_XS" ;;
+        *iq6_xxs*|*iq6_xxs-*)    echo "IQ6_XXS" ;;
+        *iq6_xs*|*iq6_xs-*)      echo "IQ6_XS" ;;
+        *iq5_xxs*|*iq5_xxs-*)    echo "IQ5_XXS" ;;
+        *iq5_xs*|*iq5_xs-*)      echo "IQ5_XS" ;;
+        *iq4_nl*|*iq4_nl-*)      echo "IQ4_NL" ;;
+        *iq4_xs*|*iq4_xs-*)      echo "IQ4_XS" ;;
+        *iq3_xxs*|*iq3_xxs-*)    echo "IQ3_XXS" ;;
+        *iq3_xs*|*iq3_xs-*)      echo "IQ3_XS" ;;
+        *iq2_xxs*|*iq2_xxs-*)    echo "IQ2_XXS" ;;
+        *iq2_xs*|*iq2_xs-*)      echo "IQ2_XS" ;;
+        *iq2_s*|*iq2_s-*)        echo "IQ2_S" ;;
+        *iq2_m*|*iq2_m-*)        echo "IQ2_M" ;;
+        *iq1_s*|*iq1_s-*)        echo "IQ1_S" ;;
+        *f16*|*fp16*|*float16*)  echo "F16" ;;
+        *bf16*)                  echo "BF16" ;;
+        *f32*|*fp32*|*float32*)  echo "F32" ;;
+        *gptq*)                  echo "GPTQ" ;;
+        *awq*)                   echo "AWQ" ;;
+        *exl2*)                  echo "EXL2" ;;
+        *safetensors*)           echo "Safetensors" ;;
+        *gguf*)                  echo "GGUF" ;;
+        *)                       echo "unknown" ;;
+    esac
+}
+
+detect_format() { # $1=filename -> format label
+    case "$1" in
+        *.gguf)       echo "GGUF" ;;
+        *.safetensors) echo "Safetensors" ;;
+        *.bin)        echo "PyTorch" ;;
+        *.pt)         echo "PyTorch" ;;
+        *.json)       echo "Config" ;;
+        *.txt)        echo "Text" ;;
+        *)            echo "Other" ;;
+    esac
+}
+
+# ---------- subcommands ----------
+
+cmd_search() {
+    # $1=query $2=sort $3=limit $4=author $5=gguf_only $6=offset
+    _query="${1:-}"
+    _sort="${2:-downloads}"
+    _limit="${3:-100}"
+    _author="${4:-}"
+    _gguf_only="${5:-}"
+    _offset="${6:-0}"
+
+    # Build API URL (PS5LM-Plus approach: filter=gguf works)
+    _url="https://huggingface.co/api/models?sort=$_sort&direction=-1&limit=$_limit"
+    [ "$_gguf_only" = "gguf" ] && _url="$_url&filter=gguf"
+    [ -n "$_query" ] && _url="$_url&search=$(printf '%s' "$_query" | python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.stdin.read()))' 2>/dev/null || printf '%s' "$_query")"
+    [ -n "$_author" ] && _url="$_url&author=$_author"
+
+    _json=$(python3 -c "
+import urllib.request, json, sys
+url = sys.argv[1]
+req = urllib.request.Request(url)
+try:
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        print(json.dumps(json.load(resp)))
+except Exception as e:
+    print(f'ERROR: {e}', file=sys.stderr)
+    sys.exit(1)
+" "$_url" 2>/dev/null) || {
+        echo "ERROR: API request failed" >&2
+        return 1
+    }
+
+    # Parse
+    printf '%s' "$_json" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for m in data:
+    mid = m.get('id', '')
+    dl = m.get('downloads', 0)
+    likes = m.get('likes', 0)
+    tags = m.get('tags', [])
+    gguf = 'gguf' in tags
+    print(f'{mid}|{dl}|{likes}|{'GGUF' if gguf else ''}')
+" 2>/dev/null
+}
+
+
+cmd_search_page() {
+    # $1=query $2=sort $3=limit $4=author $5=gguf_only $6=continue_file
+    # Prints result lines. Reads an optional continuation URL from $6 and
+    # replaces it with the URL for the next page (empty on the last page).
+    _query="${1:-}"
+    _sort="${2:-downloads}"
+    _limit="${3:-100}"
+    _author="${4:-}"
+    _gguf_only="${5:-}"
+    _cont_file="${6:-}"
+
+    [ -n "$_cont_file" ] || { echo "ERROR: search-page needs a continue file" >&2; return 1; }
+
+    _out=$(python3 - "$_query" "$_sort" "$_limit" "$_author" "$_gguf_only" "$_cont_file" <<'PY'
+import json, re, sys, time, urllib.parse, urllib.request
+
+query, sort, limit, author, gguf, cont_file = sys.argv[1:7]
+url = ""
+try:
+    with open(cont_file, "r", encoding="utf-8") as f:
+        url = f.read().strip()
+except Exception:
+    url = ""
+
+if not url:
+    params = [
+        ("sort", sort),
+        ("direction", "-1"),
+        ("limit", limit),
+    ]
+    if gguf == "gguf":
+        params.append(("filter", "gguf"))
+    if query:
+        params.append(("search", query))
+    if author:
+        params.append(("author", author))
+    url = "https://huggingface.co/api/models?" + urllib.parse.urlencode(params)
+
+data = None
+link = ""
+last_error = "unknown error"
+for attempt in range(3):
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            data = json.load(resp)
+            link = resp.headers.get("Link", "")
+        break
+    except Exception as e:
+        last_error = str(e)
+        if attempt < 2:
+            time.sleep(2 * (attempt + 1))
+
+if data is None:
+    sys.stderr.write("ERROR: HF API request failed: {}\n".format(last_error))
+    sys.exit(1)
+
+for m in data:
+    mid = m.get("id", "")
+    dl = m.get("downloads", 0)
+    likes = m.get("likes", 0)
+    tags = m.get("tags", [])
+    fmt = "GGUF" if "gguf" in tags else ""
+    if mid:
+        print("{}|{}|{}|{}".format(mid, dl, likes, fmt))
+
+next_url = ""
+mo = re.search(r"<([^>]+)>;\s*rel=\"next\"", link)
+if mo:
+    next_url = mo.group(1)
+
+with open(cont_file, "w", encoding="utf-8") as f:
+    f.write(next_url)
+PY
+) || { echo "ERROR: model search failed" >&2; return 1; }
+    printf '%s' "$_out"
+}
+
+cmd_files() {
+    # $1=repo_id -> list files with sizes (PS5LM-Plus: /tree/main)
+    _repo="$1"
+    _url="https://huggingface.co/api/models/$_repo/tree/main"
+
+    _json=$(python3 -c "
+import urllib.request, json, sys
+url = sys.argv[1]
+req = urllib.request.Request(url)
+try:
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        print(json.dumps(json.load(resp)))
+except Exception as e:
+    print(f'ERROR: {e}', file=sys.stderr)
+    sys.exit(1)
+" "$_url" 2>/dev/null) || {
+        echo "ERROR: failed to list files" >&2
+        return 1
+    }
+
+    # Parse: path|size (use lfs.size for large files)
+    printf '%s' "$_json" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for e in data:
+    path = e.get('path', '')
+    size = e.get('size', 0)
+    if e.get('lfs') and isinstance(e['lfs'], dict):
+        size = e['lfs'].get('size', size)
+    if path:
+        print(f'{path}|{size}')
+" 2>/dev/null
+}
+
+
+cmd_info() {
+    # $1=repo_id -> model info (name, author, downloads, likes, tags)
+    _repo="$1"
+    hf models info "$_repo" --format json 2>/dev/null
+}
+
+cmd_download() {
+    # $1=repo_id $2=dest_dir $3...=file patterns (or --all)
+    # Starts a background download, writes job state.
+    _repo="$1"
+    _dest="$2"
+    shift 2
+
+    # Validate destination
+    mkdir -p "$_dest" 2>/dev/null || { echo "ERROR: cannot create $_dest" >&2; return 1; }
+    [ -w "$_dest" ] || { echo "ERROR: $_dest not writable" >&2; return 1; }
+
+    # Check disk space (warn only, don't block)
+    _free=$(disk_free_bytes)
+    [ -n "$_free" ] && echo "Disk free: $(human_size "$_free")" >&2
+
+    # Build hf download command
+    _job_id=$(date +%Y%m%d_%H%M%S)_$$
+    _job_file="$HF_JOBS/$_job_id"
+
+    # Construct file arguments
+    _file_args=""
+    for _f in "$@"; do
+        if [ "$_f" = "--all" ]; then
+            _file_args=""  # no file filter = download all
+            break
+        elif [ "$_f" = "--include" ]; then
+            # next arg is a glob
+            :
+        else
+            _file_args="$_file_args $_f"
+        fi
+    done
+
+    # Determine include patterns
+    _include_args=""
+    if [ -z "$_file_args" ]; then
+        # Download all files (no filter)
+        :
+    else
+        # Use specific filenames
+        _include_args=$(echo "$_file_args" | tr ' ' '\n' | grep -v '^$' | while read -r f; do
+            echo "--include $f"
+        done | tr '\n' ' ')
+    fi
+
+    # Write job file
+    {
+        echo "id=$_job_id"
+        echo "repo=$_repo"
+        echo "dest=$_dest"
+        echo "files=$*"
+        echo "status=starting"
+        echo "started=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "pid="
+        echo "progress="
+        echo "bytes_done=0"
+        echo "bytes_total=0"
+        echo "error="
+    } > "$_job_file"
+
+    # Start background download
+    _auth=$(hf_auth_args)
+    # shellcheck disable=SC2086
+    nohup hf download "$_repo" \
+        $_auth \
+        ${_include_args} \
+        --local-dir "$_dest" \
+        --max-workers "$MAX_WORKERS" \
+        > "$_job_file.log" 2>&1 &
+    _pid=$!
+    echo "pid=$_pid" > "$_job_file.pid"
+
+    # Update job file with PID
+    sed -i "s/^pid=\$/pid=$_pid/" "$_job_file" 2>/dev/null || true
+
+    echo "$_job_id"
+}
+
+cmd_status() {
+    # $1=job_id -> print status
+    _job="$1"
+    _job_file="$HF_JOBS/$_job"
+    [ -f "$_job_file" ] || { echo "ERROR: job not found: $_job" >&2; return 1; }
+
+    # Read current state
+    . "$_job_file" 2>/dev/null || true
+
+    # Check if process is still running
+    _pid=$(grep '^pid=' "$_job_file" | cut -d= -f2)
+    _running="no"
+    [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null && _running="yes"
+
+    # Check log for progress
+    _log="$_job_file.log"
+    _progress=""
+    _bytes_done=0
+    _bytes_total=0
+    if [ -f "$_log" ]; then
+        # hf download uses tqdm; look for progress indicators
+        _last=$(tail -5 "$_log" 2>/dev/null | tr '\r' '\n' | grep -E '[0-9]+%' | tail -1 || true)
+        [ -n "$_last" ] && _progress="$_last"
+    fi
+
+    # Determine status
+    _status=$(grep '^status=' "$_job_file" | cut -d= -f2-)
+    if [ "$_running" = "yes" ]; then
+        _status="downloading"
+    elif [ "$_status" = "starting" ] || [ "$_status" = "downloading" ]; then
+        # Process ended - check if successful
+        _rc=0
+        # Check if files exist in dest
+        if [ -f "$_job_file.log" ] && grep -qi "error\|failed\|denied" "$_job_file.log" 2>/dev/null; then
+            _status="failed"
+        else
+            _status="completed"
+        fi
+    fi
+
+    # Output status
+    printf 'id=%s\nrepo=%s\nstatus=%s\nrunning=%s\n' "$_job" "$repo" "$_status" "$_running"
+    [ -n "$_progress" ] && printf 'progress=%s\n' "$_progress"
+    _err=$(grep '^error=' "$_job_file" | cut -d= -f2-)
+    [ -n "$_err" ] && printf 'error=%s\n' "$_err"
+}
+
+cmd_jobs() {
+    # List all jobs with status
+    for _jf in "$HF_JOBS"/*; do
+        [ -f "$_jf" ] || continue
+        case "$_jf" in *.log|*.pid) continue;; esac
+        _id=$(basename "$_jf")
+        _repo=$(grep '^repo=' "$_jf" | cut -d= -f2-)
+        _status=$(grep '^status=' "$_jf" | cut -d= -f2-)
+        _pid=$(grep '^pid=' "$_jf" | cut -d= -f2)
+        _running="no"
+        [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null && _running="yes"
+        if [ "$_running" = "yes" ]; then
+            _status="downloading"
+        elif [ "$_status" = "starting" ] || [ "$_status" = "downloading" ]; then
+            # Process ended - determine outcome
+            if [ -f "$_jf.log" ] && grep -qi "error\|failed\|denied\|401\|403" "$_jf.log" 2>/dev/null; then
+                _status="failed"
+            else
+                _status="completed"
+            fi
+        fi
+        printf '%s|%s|%s\n' "$_id" "$_repo" "$_status"
+    done
+}
+
+cmd_cancel() {
+    # $1=job_id -> cancel (kill process)
+    _job="$1"
+    _job_file="$HF_JOBS/$_job"
+    [ -f "$_job_file" ] || { echo "ERROR: job not found" >&2; return 1; }
+    _pid=$(grep '^pid=' "$_job_file" | cut -d= -f2)
+    if [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null; then
+        kill "$_pid" 2>/dev/null || true
+        sleep 1
+        kill -9 "$_pid" 2>/dev/null || true
+    fi
+    sed -i 's/^status=.*/status=cancelled/' "$_job_file"
+    echo "cancelled"
+}
+
+cmd_remove() {
+    # $1=job_id -> remove job from tracking list (does NOT delete model files)
+    _job="$1"
+    _job_file="$HF_JOBS/$_job"
+    [ -f "$_job_file" ] || { echo "ERROR: job not found" >&2; return 1; }
+    # Kill process if still running
+    _pid=$(grep '^pid=' "$_job_file" | cut -d= -f2)
+    if [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null; then
+        kill "$_pid" 2>/dev/null || true
+        sleep 1
+        kill -9 "$_pid" 2>/dev/null || true
+    fi
+    # Remove tracking files only (job file, log, pid)
+    rm -f "$_job_file" "$_job_file.log" "$_job_file.pid"
+    echo "removed"
+}
+
+cmd_inventory() {
+    # List local inventory
+    cat "$HF_INVENTORY"
+}
+
+cmd_inventory_add() {
+    # $1=repo_id $2=revision $3=path $4=quant $5=format
+    _repo="$1"
+    _rev="${2:-main}"
+    _path="$3"
+    _quant="${4:-unknown}"
+    _fmt="${5:-unknown}"
+    _size=0
+    [ -f "$_path" ] && _size=$(wc -c < "$_path" 2>/dev/null || echo 0)
+    # Remove existing entry for same path
+    grep -vF "$_path" "$HF_INVENTORY" > "$HF_INVENTORY.tmp" 2>/dev/null || true
+    mv "$HF_INVENTORY.tmp" "$HF_INVENTORY"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$_repo" "$_rev" "$_path" "$_size" "installed" "$_quant" "$_fmt" >> "$HF_INVENTORY"
+}
+
+cmd_inventory_scan() {
+    # Scan local models dir and reconcile inventory
+    # Add files not in inventory, mark missing files
+    _existing=$(cut -f3 "$HF_INVENTORY" 2>/dev/null)
+    _scan_files=$(find "$MODELS_DIR" -name "*.gguf" -type f 2>/dev/null)
+    for _f in $_scan_files; do
+        [ -f "$_f" ] || continue
+        if ! echo "$_existing" | grep -qF "$_f"; then
+            _quant=$(detect_quant "$_f")
+            _fmt=$(detect_format "$_f")
+            _size=$(wc -c < "$_f" 2>/dev/null || echo 0)
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "local" "n/a" "$_f" "$_size" "installed" "$_quant" "$_fmt" >> "$HF_INVENTORY"
+        fi
+    done
+}
+
+cmd_auth_set() {
+    # $1=token -> store token
+    printf '%s' "$1" > "$HF_TOKEN_FILE"
+    chmod 600 "$HF_TOKEN_FILE"
+    echo "Token stored."
+}
+
+cmd_auth_status() {
+    if [ -f "$HF_TOKEN_FILE" ]; then
+        echo "authenticated (local token)"
+    elif hf auth status --format json 2>/dev/null | grep -q '"authenticated":true'; then
+        echo "authenticated (hf CLI)"
+    else
+        echo "not authenticated"
+    fi
+}
+
+cmd_categories() {
+    # Output curated community categories for the TUI
+    cat << 'CATEOF'
+official|Official Models
+fine-tunes|Fine-Tunes & Instruction Tuning
+coding|Coding Models
+uncensored|Uncensored & Abliterated
+CATEOF
+}
+
+cmd_publishers() {
+    # Output verified publishers for a category
+    # $1=category
+    _cat="${1:-gguf-community}"
+    case "$_cat" in
+        official)
+            cat << 'PUEOF'
+Qwen|Qwen
+deepseek-ai|DeepSeek
+meta-llama|Meta Llama
+google|Google Gemma
+mistralai|Mistral AI
+microsoft|Microsoft Phi
+nvidia|NVIDIA
+alibaba-pai|Alibaba
+PUEOF
+            ;;
+        gguf-community)
+            cat << 'PUEOF'
+bartowski|bartowski
+mradermacher|mradermacher
+lmstudio-community|lmstudio-community
+MaziyarPanahi|MaziyarPanahi
+QuantFactory|QuantFactory
+TheBloke|TheBloke
+PUEOF
+            ;;
+        fine-tunes)
+            cat << 'PUEOF'
+NousResearch|NousResearch
+HuggingFaceH4|HuggingFaceH4
+unsloth|Unsloth
+ArliAI|ArliAI
+Sao10K|Sao10K
+Gryphe|Gryphe
+NeverSleep|NeverSleep
+PUEOF
+            ;;
+        uncensored)
+            cat << 'PUEOF'
+huihui-ai|Huihui-AI
+TheDrummer|TheDrummer
+PUEOF
+            ;;
+        reasoning)
+            cat << 'PUEOF'
+deepseek-ai|DeepSeek
+Qwen|Qwen
+NousResearch|NousResearch
+PUEOF
+            ;;
+        coding)
+            cat << 'PUEOF'
+Qwen|Qwen
+deepseek-ai|DeepSeek
+microsoft|Microsoft Phi
+PUEOF
+            ;;
+        *)
+            echo "no publishers configured for $_cat" >&2
+            return 1
+            ;;
+    esac
+}
+
+# ---------- dispatch ----------
+
+case "${1:-help}" in
+    search)     shift; cmd_search "$@" ;;
+    search-page) shift; cmd_search_page "$@" ;;
+    files)      shift; cmd_files "$@" ;;
+    info)       shift; cmd_info "$@" ;;
+    download)   shift; cmd_download "$@" ;;
+    status)     shift; cmd_status "$@" ;;
+    jobs)       shift; cmd_jobs "$@" ;;
+    cancel)     shift; cmd_cancel "$@" ;;
+    remove)     shift; cmd_remove "$@" ;;
+    inventory)  shift; cmd_inventory "$@" ;;
+    inventory-add) shift; cmd_inventory_add "$@" ;;
+    inventory-scan) shift; cmd_inventory_scan "$@" ;;
+    auth-set)   shift; cmd_auth_set "$@" ;;
+    auth-status) shift; cmd_auth_status "$@" ;;
+    categories) shift; cmd_categories "$@" ;;
+    publishers) shift; cmd_publishers "$@" ;;
+    help|*)
+        echo "Usage: ps5llm-hf <command> [args]"
+        echo ""
+        echo "Commands:"
+        echo "  search [query] [sort] [limit] [author]  - Search HF models"
+    echo "  search-page <q> <sort> <limit> <author> <gguf> <contfile> - Paginated search"
+        echo "  files <repo_id>                         - List files in repo"
+        echo "  info <repo_id>                          - Get model info"
+        echo "  download <repo> <dest> <files...>       - Start background download"
+        echo "  status <job_id>                         - Check download status"
+        echo "  jobs                                    - List all jobs"
+        echo "  cancel <job_id>                         - Cancel a download"
+        echo "  inventory                               - Show local inventory"
+        echo "  inventory-scan                          - Scan local models"
+        echo "  auth-set <token>                        - Store HF token"
+        echo "  auth-status                             - Check auth status"
+        echo "  categories                              - List community categories"
+        echo "  publishers <category>                   - List publishers"
+        ;;
+esac
