@@ -98,6 +98,7 @@ wifi_ifaces() {
 stats_block() {
     srv="STOPPED"; llama_running && srv="RUNNING"
     mdl=$(basename "$(cfg_get MODEL)" 2>/dev/null || echo none)
+    [ -n "$mdl" ] || mdl="none"
     {
         echo "--- status ---"
         ps5llm mon once 2>/dev/null | sed -n '2,6p'
@@ -296,8 +297,7 @@ menu_wifi() {
     sleep 3
 
     # Save for auto-connect on boot
-    if yesno "Connect to '$ssid' automatically on every boot?
-\nThis saves the network and enables WiFi at startup."; then
+    if yesno "Connect to '$ssid' automatically on every boot?\n\nThis saves the network and enables WiFi at startup."; then
         # Ensure wpa_supplicant service is enabled at boot
         rc-update add wpa_supplicant default 2>/dev/null || true
         # Also add wpa_cli if present (handles DHCP signaling)
@@ -351,10 +351,12 @@ menu_server_settings() {
             | pick_one "Server launch settings (global).
 Changes restart llama.cpp.") || return 0
         [ "$sel" = "back" ] && return 0
-        [ "$sel" = "context" ] && { menu_context; continue; }
-        [ "$sel" = "mtp" ] && { menu_mtp; continue; }
-        [ "$sel" = "thinking" ] && { menu_thinking; continue; }
-        [ "$sel" = "sampling" ] && { menu_sampling; continue; }
+        case "$sel" in
+            context)  menu_context || true;  continue;;
+            mtp)      menu_mtp || true;      continue;;
+            thinking) menu_thinking || true; continue;;
+            sampling) menu_sampling || true; continue;;
+        esac
         cur=$(cfg_get "$sel")
         if [ "$sel" = "PORT" ]; then
             yesno "Changing PORT will disconnect agent harness/worker until their URLs are updated.\n\nContinue?" || continue
@@ -445,8 +447,11 @@ menu_fan() {
         "max|Fan MAX (loudest)" \
         "off|Fan OFF (firmware default)" \
         | pick_one "PS5 fan control") || return 0
-    out=$(/usr/local/sbin/ps5_control --fan "$sel" 2>&1)
-    msg "Fan -> $sel\n$out"
+    if out=$(/usr/local/sbin/ps5_control --fan "$sel" 2>&1); then
+        msg "Fan -> $sel\n$out"
+    else
+        msg "Fan -> $sel FAILED\n${out:-no output from ps5_control}"
+    fi
 }
 
 menu_boost() {
@@ -455,8 +460,11 @@ menu_boost() {
         "on|Overclock ON (boost)" \
         "off|Overclock OFF" \
         | pick_one "PS5 overclock (boost)") || return 0
-    out=$(/usr/local/sbin/ps5_control --boost "$sel" 2>&1)
-    msg "Overclock -> $sel\n$out"
+    if out=$(/usr/local/sbin/ps5_control --boost "$sel" 2>&1); then
+        msg "Overclock -> $sel\n$out"
+    else
+        msg "Overclock -> $sel FAILED\n${out:-no output from ps5_control}"
+    fi
 }
 
 mtp_knob_get() {
@@ -539,6 +547,7 @@ menu_thinking() {
     eff=$(cfg_get REASONING_EFFORT)
     budget=$(cfg_get REASONING_BUDGET)
     preserve=$(cfg_get REASONING_PRESERVE)
+    budget_raw="$budget"
     [ -n "$budget" ] || budget="(no flag)"
     [ -n "$preserve" ] || preserve="(no flag)"
     if [ "$mode" = "off" ]; then st="OFF"
@@ -571,7 +580,7 @@ template reads them (e.g. Swift). Ornith is on/off.") || return 0
         on)      cfg_set REASONING_MODE on;   cfg_set REASONING_EFFORT "" ;;
         default) cfg_set REASONING_MODE on;   cfg_set REASONING_EFFORT default ;;
         budget)
-            val=$(ask_text "Reasoning budget tokens (-1 = no limit, 0 = none)" "$budget") || return 0
+            val=$(ask_text "Reasoning budget tokens (-1 = no limit, 0 = none)" "$budget_raw") || return 0
             out=$(ps5llm reasoning budget "$val" 2>&1) || { msg "Rejected:\n\n$out"; return 1; }
             msg "$out"; return 0 ;;
         preserve)
@@ -683,7 +692,12 @@ menu_cu() {
         | pick_one "GPU CUs: ${cur:-unknown}, module: $([ "$mod" -gt 0 ] && echo loaded || echo n/a), unlock armed: $armed") || return 0
     case "$sel" in
         status) msg "dmesg: ${cur:-unknown}\nmodprobe config: $([ -f "$cfg" ] && cat "$cfg" || echo none)\nNOTE: unlock needs the ported module (plan in /root/)." ;;
-        on) printf "%s\n" "# PS5 CU unlock (armed from TUI; installer uncomments once" "# the ported module exists -- active unknown params break driver load)" "#options amdgpu ps5_cc_write_mode=3" > "$cfg"; msg "CU unlock ARMED (staged safe).\nInstaller activates it with the ported module.\nSee /root/PS5-CU-PORT-PLAN.txt." ;;
+        on) mkdir -p /etc/modprobe.d
+            if printf "%s\n" "# PS5 CU unlock (armed from TUI; installer uncomments once" "# the ported module exists -- active unknown params break driver load)" "#options amdgpu ps5_cc_write_mode=3" > "$cfg" 2>/dev/null; then
+                msg "CU unlock ARMED (staged safe).\nInstaller activates it with the ported module.\nSee /root/PS5-CU-PORT-PLAN.txt."
+            else
+                msg "FAILED to write $cfg\n(CU unlock NOT armed)"
+            fi ;;
         off) rm -f "$cfg"; msg "CU unlock OFF (stock 36 CUs). Config removed." ;;
     esac
 }
@@ -726,6 +740,7 @@ menu_main() {
     while true; do
         st="STOPPED"; llama_running && st="RUNNING"
         cur=$(basename "$(cfg_get MODEL)" 2>/dev/null || echo none)
+        [ -n "$cur" ] || cur="none"
         mtpst="OFF"; [ "$(cfg_get SPEC_TYPE)" = "draft-mtp" ] && mtpst="ON"
         mtpdesc="$mtpst"; [ "$mtpst" = "ON" ] && mtpdesc="$mtpst, $(mtp_knob_get)/step"
         tmode=$(cfg_get REASONING_MODE); teff=$(cfg_get REASONING_EFFORT)
@@ -736,7 +751,9 @@ menu_main() {
         # Stats snapshot in the header: fresh on every draw (i.e. after
         # every action), no background refresh loops, nothing to get stuck
         # in. Cancel/ESC simply redraws.
-        prompt="$(stats_block)"
+        prompt="$(stats_block)
+
+MTP: $mtpdesc   Thinking: $thst"
         sel=$(printf '%s\n' \
             "models|Models  (loaded: $cur)" \
             "hfmodels|Hugging Face  (browse/download)" \

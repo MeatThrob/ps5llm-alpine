@@ -24,7 +24,7 @@ start() {
     if [ ! -f /etc/llama/llama.conf ]; then
         # Fresh conf gets the PS5LM-Plus launch recipe by default so every
         # current and future model runs with the same memory-safe flags.
-        printf %s\n \
+        printf '%s\n' \
             "MODEL=/models/iq3-27b.gguf" \
             "HOST=0.0.0.0" \
             "PORT=8080" \

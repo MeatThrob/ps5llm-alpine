@@ -1015,10 +1015,10 @@ cmd_fan() {
     local action="$1"
     case "$action" in
         on|off|max)
-            if [ -x /usr/bin/ps5-control ]; then
-                /usr/bin/ps5-control --fan "$action"
+            if [ -x /usr/local/sbin/ps5_control ]; then
+                /usr/local/sbin/ps5_control --fan "$action"
             else
-                echo "ps5-control binary missing (/usr/bin/ps5-control not built)" >&2
+                echo "ps5_control binary missing (/usr/local/sbin/ps5_control not built)" >&2
                 echo "Rebuild the image (build.sh compiles it from ps5-linux-tools)." >&2
                 exit 1
             fi
@@ -1035,10 +1035,10 @@ cmd_boost() {
     local action="$1"
     case "$action" in
         on|off)
-            if [ -x /usr/bin/ps5-control ]; then
-                /usr/bin/ps5-control --boost "$action"
+            if [ -x /usr/local/sbin/ps5_control ]; then
+                /usr/local/sbin/ps5_control --boost "$action"
             else
-                echo "ps5-control binary missing (/usr/bin/ps5-control not built)" >&2
+                echo "ps5_control binary missing (/usr/local/sbin/ps5_control not built)" >&2
                 echo "Rebuild the image (build.sh compiles it from ps5-linux-tools)." >&2
                 exit 1
             fi

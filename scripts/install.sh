@@ -86,6 +86,12 @@ rc-update add syslog-ng default
 rc-update add chronyd default
 rc-update add crond default
 
+# Boot-time WiFi restore (associate + DHCP). The wpa_supplicant service only
+# associates; without this nothing runs a DHCP client after boot.
+mkdir -p /etc/local.d
+install -m 755 "$REPO_ROOT/etc/wifi-restore.start" /etc/local.d/wifi-restore.start
+rc-update add local default 2>/dev/null || true
+
 echo "  Services configured."
 
 # ---------- 5. Directory structure + clean configs ----------

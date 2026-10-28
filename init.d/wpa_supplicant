@@ -70,7 +70,7 @@ start_pre() {
 	fi
 	case " ${command_args}" in
 	*" -u"*);;
-	*)	if yesno "{wpa_supplicant_dbus}"; then
+	*)	if yesno "${wpa_supplicant_dbus}"; then
 			command_args="-u ${command_args}"
 		fi
 		;;

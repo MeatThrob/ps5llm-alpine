@@ -1,0 +1,43 @@
+#!/bin/sh
+# wifi-restore: bring up WiFi on boot using the existing wpa_supplicant.conf
+# (written by `ps5llm wifi connect`). Tries every wireless interface
+# (wlan* = USB adapters, mlan* = onboard, wlp* = systemd names) — the first
+# one to associate AND get a DHCP lease wins. No hardcoded interface.
+WPA_CONF="/etc/wpa_supplicant/wpa_supplicant.conf"
+[ -f "$WPA_CONF" ] || exit 0
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
+# OpenRC supervises wpa_supplicant on the first wireless interface it finds.
+# If that one cannot associate it respawns 5x and gives up, and its respawn
+# can race the per-interface instances started below (second instance then
+# fails with "ctrl_iface in use", exit 255). Stop it first.
+rc-service wpa_supplicant stop >/dev/null 2>&1 || true
+
+_found=0
+for iface in $(ls /sys/class/net/ 2>/dev/null | grep -E '^(wlan|mlan|wlp)'); do
+    _found=1
+    ip link set dev "$iface" up 2>/dev/null || continue
+    pkill -f "wpa_supplicant.*$iface" 2>/dev/null || true
+    rm -f "/var/run/udhcpc.$iface.pid"
+    # -B daemonizes only after the driver/interface initialised, so a nonzero
+    # exit here is the real reason the interface is unusable. Log it instead
+    # of failing silently.
+    if ! _err=$(wpa_supplicant -B -i "$iface" -c "$WPA_CONF" 2>&1); then
+        logger -t wifi-restore "wpa_supplicant failed on $iface: ${_err:-no output}"
+        continue
+    fi
+    sleep 4
+    if wpa_cli -i "$iface" status 2>/dev/null | grep -q 'wpa_state=COMPLETED'; then
+        udhcpc -b -R -t 5 -T 3 -i "$iface" -p "/var/run/udhcpc.$iface.pid" 2>/dev/null || true
+        sleep 3
+        if ip addr show "$iface" 2>/dev/null | grep 'inet ' | grep -qv '169\.254\.'; then
+            logger -t wifi-restore "WiFi up on $iface"
+            break
+        fi
+        logger -t wifi-restore "$iface associated but got no DHCP lease"
+    else
+        logger -t wifi-restore "$iface did not associate (wpa_state != COMPLETED)"
+    fi
+done
+[ "$_found" = "1" ] || logger -t wifi-restore "no wireless interface found"
+exit 0
