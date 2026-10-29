@@ -1,6 +1,6 @@
 # PS5 LLM Alpine Distro
 
-A clean, self-contained Alpine Linux distribution for running LLMs on PS5
+A clean, self-contained server based Alpine Linux distribution for running LLMs on PS5
 
 
 ## Quick Start
