@@ -5,37 +5,29 @@ A clean, self-contained server based Alpine Linux distribution for running LLMs 
 
 ## Download the full image
 
-A ready-to-boot distro image (**everything except model files**) is published here:
+A ready-to-boot, **fully sanitized** distro image (**everything except model files**) is published here:
 
 **https://github.com/MeatThrob/ps5llm-alpine/releases/tag/image-2026.11.04**
 
-Assets:
+Asset: **`ps5llm-alpine.img.xz`** — one complete GPT disk image (EFI boot + root filesystem), ready to flash.
 
-- `ps5llm-rootfs.img.zst.part-00` / `.part-01` — root filesystem (16 GiB ext4, expands on first boot)
-- `ps5llm-boot.tar.zst` — EFI boot partition (kernel, initrd, cmdline)
-- `SHA256SUMS` — checksums
+- Size: `1.47 GiB (1,574,354,560 bytes)`
+- SHA256: `3f7ed59218f53a6d21d59f33d8e78f56804d903a266dc10ca44949c18093b50c`
 
-Install:
+Flash it to a **whole drive** (not a partition). This erases the entire drive:
 
 ```sh
-# reassemble + decompress the root filesystem
-cat ps5llm-rootfs.img.zst.part-* > ps5llm-rootfs.img.zst
-sha256sum -c SHA256SUMS --ignore-missing
-zstd -d ps5llm-rootfs.img.zst
-
-# root filesystem -> partition 2 (ext4, label ps5llm)
-sudo dd if=ps5llm-rootfs.img of=/dev/sdX2 bs=4M status=progress conv=fsync
-
-# boot files -> partition 1 (FAT32, label BOOT)
-sudo mkfs.vfat -F32 -n BOOT /dev/sdX1
-sudo mount /dev/sdX1 /mnt
-sudo tar -C /mnt -xf ps5llm-boot.tar.zst --zstd
-sync && sudo umount /mnt
+xz -dc ps5llm-alpine.img.xz | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync
+sync
 ```
 
-Then boot from the drive and run `ps5llm wifi connect`. The image ships with
-**no models** — use `ps5llm-tui` → Hugging Face to download one.
+> Replace `/dev/sdX` with the target drive (for example `/dev/sdb`, or `/dev/disk4` on macOS). Double-check the device before running.
 
+On first boot the root partition and ext4 filesystem expand automatically to fill the drive, so all remaining space is available for models under `/models`.
+
+The image ships with **no models** and **no WiFi network configured**. Connect the PS5 to HDMI with a keyboard, use the on-screen TUI to join WiFi, then download a model via **Hugging Face (browse/download)**.
+
+Sanitized: no WiFi SSIDs/PSKs, no IP or router information, no MAC addresses, no machine-id, no SSH host keys, no shell history, and no personal configs. Fresh SSH host keys are generated on first boot.
 
 ## Quick Start
 
