@@ -11,8 +11,8 @@ A ready-to-boot, **fully sanitized** distro image (**everything except model fil
 
 Asset: **`ps5llm-alpine.img.xz`** — one complete GPT disk image (EFI boot + root filesystem), ready to flash.
 
-- Size: `1.47 GiB (1,574,354,560 bytes)`
-- SHA256: `3f7ed59218f53a6d21d59f33d8e78f56804d903a266dc10ca44949c18093b50c`
+- Size: `1.47 GiB (1,574,350,240 bytes)`
+- SHA256: `3c8fe7632e11b7e7c192e2b727127c4d47f60aa4ab6352316eed5d04040bd474`
 
 Flash it to a **whole drive** (not a partition). This erases the entire drive:
 
